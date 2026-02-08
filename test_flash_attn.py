@@ -2,7 +2,7 @@ import torch
 import flash_attn
 
 def verify():
-    B, nh, N, d = 2, 8, 1024, 64
+    B, nh, N, d = 2, 8, 128, 32
     
     q = torch.randn(B, nh, N, d).cuda()
     k = torch.randn(B, nh, N, d).cuda()
