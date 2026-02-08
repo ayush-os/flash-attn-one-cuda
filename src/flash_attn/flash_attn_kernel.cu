@@ -11,22 +11,20 @@ __global__ void flash_attn_kernel(const float *__restrict__ q,
                                   float *m,
                                   const int B,
                                   const int nh,
-                                  const in N,
+                                  const int N,
                                   const int d,
                                   const int Bc,
                                   const int Br,
-                                  const int Tc,
-                                  const int Tr,
                                   const float softmax_scale)
 {
     extern __shared__ float s[];
     float *Qi = s;
     float *Kj = &Qi[Br * d];
-    char *Vj = &Kj[Bc * d];
+    float *Vj = &Kj[Bc * d];
 
-    float Oi[head_dim] = {0.0f};
-    float li = 0.0f;
-    float mi = __int_as_float(0xff800000);
+    float Oi[head_dim];
+    float li;
+    float mi;
 
     int qkv_offset = (blockIdx.x * nh * N * d) + (blockIdx.y * N * d);
     int lm_offset = (blockIdx.x * nh * N) + (blockIdx.y * N);
@@ -37,30 +35,47 @@ __global__ void flash_attn_kernel(const float *__restrict__ q,
         // step 8: load Qi, Oi, li, mi into sram
         int row_idx = i + threadIdx.x;
 
-        const float *q_row_ptr = q + qkv_offset + (row_idx * d);
-        float *o_row_ptr = out + qkv_offset + (row_idx * d);
-        for (int k = 0; k < d; k++)
+        if (row_idx < N)
         {
-            Qi[threadIdx.x * d + k] = q_row_ptr[k];
-            Oi[k] = out_row_ptr[k]
+            const float *q_row_ptr = q + qkv_offset + (row_idx * d);
+            float *out_row_ptr = out + qkv_offset + (row_idx * d);
+            for (int k = 0; k < d; k++)
+            {
+                Qi[threadIdx.x * d + k] = q_row_ptr[k];
+                Oi[k] = out_row_ptr[k];
+            }
+            li = l[lm_offset + row_idx];
+            mi = m[lm_offset + row_idx];
         }
-        li = l[lm_offset + row_idx];
-        mi = m[lm_offset + row_idx];
-        // end step 8
-
-        for (int j = 0; j < N; j += Bc) // step 5
+        else
         {
-            // step 6: load Kj, Vj into sram
-            int offset = j * d;
-            const float *k_ptr = k + qkv_offset + offset;
-            const float *v_ptr = v + qkv_offset + offset;
+            for (int k = 0; k < d; k++)
+            {
+                Qi[threadIdx.x * d + k] = 0.0f;
+                Oi[k] = 0.0f;
+            }
+            li = 0.0f;
+            mi = -INFINITY;
+        }
+        __syncthreads(); // technically removable, but better for clarity - at this point, Qi is fully loaded
+
+        for (int j = 0; j < N; j += Bc)
+        {
             for (int k = threadIdx.x; k < (Bc * d); k += blockDim.x)
             {
-                Kj[k] = k_ptr[k];
-                Vj[k] = v_ptr[k];
+                int col_row_idx = j + (k / d);
+                if (col_row_idx < N)
+                {
+                    Kj[k] = k[qkv_offset + (j * d) + k];
+                    Vj[k] = v[qkv_offset + (j * d) + k];
+                }
+                else
+                {
+                    Kj[k] = 0.0f;
+                    Vj[k] = 0.0f;
+                }
             }
-
-            __syncthreads();
+            __syncthreads(); // at this point Kj and Vj are fully loaded
         }
     }
 }
@@ -77,8 +92,6 @@ void launch_flash_attn_kernel(const float *q,
                               int d,
                               int Bc,
                               int Br,
-                              int Tc,
-                              int Tr,
                               float scale,
                               dim3 grid,
                               dim3 block,
@@ -86,15 +99,15 @@ void launch_flash_attn_kernel(const float *q,
 {
     if (d <= 32)
     {
-        flash_attn_kernel<32><<<grid, block, smem>>>(q, k, v, out, l, m, B, nh, N, d, Bc, Br, Tc, Tr, scale);
+        flash_attn_kernel<32><<<grid, block, smem>>>(q, k, v, out, l, m, B, nh, N, d, Bc, Br, scale);
     }
     else if (d <= 64)
     {
-        flash_attn_kernel<64><<<grid, block, smem>>>(q, k, v, out, l, m, B, nh, N, d, Bc, Br, Tc, Tr, scale);
+        flash_attn_kernel<64><<<grid, block, smem>>>(q, k, v, out, l, m, B, nh, N, d, Bc, Br, scale);
     }
     else if (d <= 128)
     {
-        flash_attn_kernel<128><<<grid, block, smem>>>(q, k, v, out, l, m, B, nh, N, d, Bc, Br, Tc, Tr, scale);
+        flash_attn_kernel<128><<<grid, block, smem>>>(q, k, v, out, l, m, B, nh, N, d, Bc, Br, scale);
     }
     else
     {
@@ -125,10 +138,6 @@ torch::Tensor flash_attn_cuda_forward(torch::Tensor q, torch::Tensor k, torch::T
     torch::Tensor l = torch::zeros({B, nh, N}, options);
     torch::Tensor m = torch::full({B, nh, N}, -INFINITY, options);
 
-    // Steps 3 and 4: calculate Tr and Tc
-    int Tc = (N + Bc - 1) / Bc;
-    int Tr = (N + Br - 1) / Br;
-
     dim3 grid(B, nh);
     dim3 block(Br);
 
@@ -150,8 +159,6 @@ torch::Tensor flash_attn_cuda_forward(torch::Tensor q, torch::Tensor k, torch::T
         d,
         Bc,
         Br,
-        Tc,
-        Tr,
         softmax_scale,
         grid,
         block,
