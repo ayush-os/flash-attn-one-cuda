@@ -2,6 +2,7 @@
 #include <cuda.h>
 #include <cuda_runtime.h>
 
+template <int head_dim>
 __global__ void flash_attn_kernel(const float *__restrict__ q,
                                   const float *__restrict__ k,
                                   const float *__restrict__ v,
@@ -18,6 +19,45 @@ __global__ void flash_attn_kernel(const float *__restrict__ q,
                                   const int Tr,
                                   const float softmax_scale)
 {
+}
+
+void launch_flash_attn_kernel(const float *q,
+                              const float *k,
+                              const float *v,
+                              float *out,
+                              float *l,
+                              float *m,
+                              int B,
+                              int nh,
+                              int N,
+                              int d,
+                              int Bc,
+                              int Br,
+                              int Tc,
+                              int Tr,
+                              float scale,
+                              dim3 grid,
+                              dim3 block,
+                              size_t smem)
+{
+    if (d <= 32)
+    {
+        flash_attn_kernel<32><<<grid, block, smem>>>(q, k, v, out, l, m, B, nh, N, d, Bc, Br, Tc, Tr, scale);
+    }
+    else if (d <= 64)
+    {
+        flash_attn_kernel<64><<<grid, block, smem>>>(q, k, v, out, l, m, B, nh, N, d, Bc, Br, Tc, Tr, scale);
+    }
+    else if (d <= 128)
+    {
+        flash_attn_kernel<128><<<grid, block, smem>>>(q, k, v, out, l, m, B, nh, N, d, Bc, Br, Tc, Tr, scale);
+    }
+    else
+    {
+        throw std::runtime_error(
+            "Unsupported head dimension: " + std::to_string(d) +
+            ". Supported sizes are <= 128.");
+    }
 }
 
 torch::Tensor flash_attn_cuda_forward(torch::Tensor q, torch::Tensor k, torch::Tensor v)
@@ -51,9 +91,9 @@ torch::Tensor flash_attn_cuda_forward(torch::Tensor q, torch::Tensor k, torch::T
     // Size in bytes for dynamic shared memory
     // Q_tile (Br * d) + K_tile (Bc * d) + V_tile (Bc * d)
     // O, l, m will be stored in regs
-    size_t shared_mem_bytes = (Br * d + 2 * Bc * d) * sizeof(float);
+    size_t smem_bytes = (Br * d + 2 * Bc * d) * sizeof(float);
 
-    flash_attn_kernel<<<grid, block, shared_mem_bytes>>>(
+    launch_flash_attn_kernel(
         q.data_ptr<float>(),
         k.data_ptr<float>(),
         v.data_ptr<float>(),
@@ -68,7 +108,10 @@ torch::Tensor flash_attn_cuda_forward(torch::Tensor q, torch::Tensor k, torch::T
         Br,
         Tc,
         Tr,
-        softmax_scale);
+        softmax_scale,
+        grid,
+        block,
+        smem_bytes);
 
     return out;
 }
