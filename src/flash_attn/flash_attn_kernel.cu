@@ -2,9 +2,21 @@
 #include <cuda.h>
 #include <cuda_runtime.h>
 
-// TODO: Define your __global__ kernel here.
-// Remember to use __shared__ memory for Q, K, V tiles.
-// __global__ void flash_attn_kernel(...) { ... }
+__global__ void flash_attn_kernel(const float *__restrict__ q,
+                                  const float *__restrict__ k,
+                                  const float *__restrict__ v,
+                                  float *out,
+                                  float *l,
+                                  float *m,
+                                  const int B,
+                                  const int nh,
+                                  const in N,
+                                  const int d,
+                                  const int Bc,
+                                  const int Br,
+                                  const float softmax_scale)
+{
+}
 
 torch::Tensor flash_attn_cuda_forward(torch::Tensor q, torch::Tensor k, torch::Tensor v) {
     const int B = q.size(0);
