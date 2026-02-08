@@ -14,6 +14,8 @@ __global__ void flash_attn_kernel(const float *__restrict__ q,
                                   const int d,
                                   const int Bc,
                                   const int Br,
+                                  const int Tc,
+                                  const int Tr,
                                   const float softmax_scale)
 {
 }
@@ -39,6 +41,10 @@ torch::Tensor flash_attn_cuda_forward(torch::Tensor q, torch::Tensor k, torch::T
     torch::Tensor l = torch::zeros({B, nh, N}, options);
     torch::Tensor m = torch::full({B, nh, N}, -INFINITY, options);
 
+    // Steps 3 and 4: calculate Tr and Tc
+    int Tc = (N + Bc - 1) / Bc;
+    int Tr = (N + Br - 1) / Br;
+
     dim3 grid(B, nh);
     dim3 block(Br);
 
@@ -60,6 +66,8 @@ torch::Tensor flash_attn_cuda_forward(torch::Tensor q, torch::Tensor k, torch::T
         d,
         Bc,
         Br,
+        Tc,
+        Tr,
         softmax_scale);
 
     return out;
