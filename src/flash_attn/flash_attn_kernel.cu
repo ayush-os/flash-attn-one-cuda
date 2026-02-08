@@ -25,22 +25,20 @@ torch::Tensor flash_attn_cuda_forward(torch::Tensor q, torch::Tensor k, torch::T
     const int N = q.size(2);
     const int d = q.size(3);
 
-    auto dev = q.device();
-    auto options = torch::TensorOptions().dtype(q.dtype()).device(dev);
-    
-    // Allocate Output O and stats l, m
+    float softmax_scale = 1.0 / sqrt(d);
+
+    auto options = torch::TensorOptions().dtype(q.dtype()).device(q.device());
+
+    // Step 1: Set block sizes
+    const int SRAM_SIZE = 48000;
+    int Bc = std::max(1, SRAM_SIZE / (4 * d * (int)sizeof(float)));
+    int Br = 32;
+
+    // Step 2: Init O, l, m
     torch::Tensor out = torch::zeros_like(q);
     torch::Tensor l = torch::zeros({B, nh, N}, options);
     torch::Tensor m = torch::full({B, nh, N}, -INFINITY, options);
 
-    // Calculate block sizes (Step 1)
-    // Assuming 48KB SRAM for simplicity, adjust for your GPU
-    const int SRAM_SIZE = 48000; 
-    int Bc = std::max(1, SRAM_SIZE / (4 * d * (int)sizeof(float)));
-    int Br = std::min(Bc, d);
-
-    // TODO: Define your grid and block dimensions
-    // Suggestion: One block per (Batch * Head)
     dim3 grid(B, nh);
     dim3 block(Br);
 
