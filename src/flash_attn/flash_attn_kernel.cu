@@ -18,7 +18,8 @@ __global__ void flash_attn_kernel(const float *__restrict__ q,
 {
 }
 
-torch::Tensor flash_attn_cuda_forward(torch::Tensor q, torch::Tensor k, torch::Tensor v) {
+torch::Tensor flash_attn_cuda_forward(torch::Tensor q, torch::Tensor k, torch::Tensor v)
+{
     const int B = q.size(0);
     const int nh = q.size(1);
     const int N = q.size(2);
@@ -41,7 +42,7 @@ torch::Tensor flash_attn_cuda_forward(torch::Tensor q, torch::Tensor k, torch::T
     // TODO: Define your grid and block dimensions
     // Suggestion: One block per (Batch * Head)
     dim3 grid(B, nh);
-    dim3 block(Br); 
+    dim3 block(Br);
 
     // TODO: Launch your kernel
     // flash_attn_kernel<<<grid, block, shared_mem_size>>>(
