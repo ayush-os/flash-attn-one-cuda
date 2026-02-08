@@ -19,6 +19,50 @@ __global__ void flash_attn_kernel(const float *__restrict__ q,
                                   const int Tr,
                                   const float softmax_scale)
 {
+    extern __shared__ float s[];
+    float *Qi = s;
+    float *Kj = &Qi[Br * d];
+    char *Vj = &Kj[Bc * d];
+
+    float Oi[head_dim] = {0.0f};
+    float li = 0.0f;
+    float mi = __int_as_float(0xff800000);
+
+    int qkv_offset = (blockIdx.x * nh * N * d) + (blockIdx.y * N * d);
+    int lm_offset = (blockIdx.x * nh * N) + (blockIdx.y * N);
+
+    // inverting loops from paper's algorithm for less HBM writes
+    for (int i = 0; i < N; i += Br) // step 7
+    {
+        // step 8: load Qi, Oi, li, mi into sram
+        int row_idx = i + threadIdx.x;
+
+        const float *q_row_ptr = q + qkv_offset + (row_idx * d);
+        float *o_row_ptr = out + qkv_offset + (row_idx * d);
+        for (int k = 0; k < d; k++)
+        {
+            Qi[threadIdx.x * d + k] = q_row_ptr[k];
+            Oi[k] = out_row_ptr[k]
+        }
+        li = l[lm_offset + row_idx];
+        mi = m[lm_offset + row_idx];
+        // end step 8
+
+        for (int j = 0; j < N; j += Bc) // step 5
+        {
+            // step 6: load Kj, Vj into sram
+            int offset = j * d;
+            const float *k_ptr = k + qkv_offset + offset;
+            const float *v_ptr = v + qkv_offset + offset;
+            for (int k = threadIdx.x; k < (Bc * d); k += blockDim.x)
+            {
+                Kj[k] = k_ptr[k];
+                Vj[k] = v_ptr[k];
+            }
+
+            __syncthreads();
+        }
+    }
 }
 
 void launch_flash_attn_kernel(const float *q,
