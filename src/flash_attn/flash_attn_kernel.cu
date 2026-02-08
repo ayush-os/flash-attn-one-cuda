@@ -59,8 +59,9 @@ __global__ void flash_attn_kernel(const float *__restrict__ q,
         }
         __syncthreads(); // technically removable, but better for clarity - at this point, Qi is fully loaded
 
-        for (int j = 0; j < N; j += Bc)
+        for (int j = 0; j < N; j += Bc) // step 5
         {
+            // step 6: load Kj, Vj into sram
             for (int k = threadIdx.x; k < (Bc * d); k += blockDim.x)
             {
                 int col_row_idx = j + (k / d);
