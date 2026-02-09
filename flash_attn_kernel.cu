@@ -47,7 +47,7 @@ __global__ void flash_attn_kernel(const half *__restrict__ q_ptr,
     {
         for (int j = 0; j < d; j++)
         {
-            Qi[threadIdx.x * d + j] = 0.0f;
+            Qi[threadIdx.x * d + j] = __float2half(0.0f);
         }
     }
 
