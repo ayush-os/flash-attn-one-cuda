@@ -31,8 +31,6 @@ __global__ void flash_attn_kernel(const float *__restrict__ q_ptr,
     int i = blockIdx.z * Br;
 
     float Oi[head_dim];
-    float4 Qi_regs[head_dim / 4];
-
     float li = 0.0f;
     float mi = -INFINITY;
 
@@ -57,15 +55,6 @@ __global__ void flash_attn_kernel(const float *__restrict__ q_ptr,
         else
         {
             reinterpret_cast<float4 *>(&Qi[row * d_padded + col_vec * 4])[0] = {0.f, 0.f, 0.f, 0.f};
-        }
-    }
-    __syncthreads();
-
-    if (threadIdx.x < Br)
-    {
-        for (int k = 0; k < d / 4; k++)
-        {
-            Qi_regs[k] = FETCH_FLOAT4(Qi[threadIdx.x * d_padded + k * 4]);
         }
     }
 
@@ -103,10 +92,10 @@ __global__ void flash_attn_kernel(const float *__restrict__ q_ptr,
                     break;
 
                 float Sij = 0.f;
-                for (int jj = 0; jj < d / 4; jj++)
+                for (int jj = 0; jj < d; jj += 4)
                 {
-                    float4 qVal = Qi_regs[jj];
-                    float4 kVal = FETCH_FLOAT4(Kj[(ii * d_padded) + jj * 4]);
+                    float4 qVal = FETCH_FLOAT4(Qi[(threadIdx.x * d_padded) + jj]);
+                    float4 kVal = FETCH_FLOAT4(Kj[(ii * d_padded) + jj]);
 
                     Sij += qVal.x * kVal.x;
                     Sij += qVal.y * kVal.y;
