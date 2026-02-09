@@ -20,7 +20,7 @@ def test_accuracy_and_perf():
 
     # --- 1. Ground Truth (PyTorch) ---
     def manual_attn(q, k, v):
-        scale = 0.01
+        scale = 1.0 / math.sqrt(d)
         attn = torch.matmul(q, k.transpose(-2, -1)) * scale
         attn = torch.softmax(attn.float(), dim=-1).to(q.dtype)
         return torch.matmul(attn, v)
