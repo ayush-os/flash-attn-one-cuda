@@ -19,3 +19,5 @@ pip install torch numpy ninja
 ### STEP 3: RESOLVED BANK CONFLICTS: 9.386 ms (2.5x faster than step 2)
 
 ### STEP 4: RESOLVED UNCOALESCING: 9.360 (virtually no gain)
+
+### STEP 5: VECTORIZATION: 6.318 (1.49x faster than step 4)
