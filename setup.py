@@ -5,7 +5,7 @@ setup(
     name='flash_attn',
     ext_modules=[
         CUDAExtension(
-            name='flash_attn',
+            name='flash_attn.flash_attn',
             sources=['src/flash_attn/flash_attn.cpp', 'src/flash_attn/flash_attn_kernel.cu'],
         )
     ],
