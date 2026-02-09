@@ -11,7 +11,7 @@ const int WMMA_M = 16;
 const int WMMA_N = 16;
 const int WMMA_K = 16;
 
-template <int HEAD_DIM, int WARPS_PER_BLOCK>
+template <int HEAD_DIM>
 __global__ void flash_attn_tc_kernel(
     const half *__restrict__ q,
     const half *__restrict__ k,
@@ -22,9 +22,6 @@ __global__ void flash_attn_tc_kernel(
     const int N,
     const float softmax_scale)
 {
-    int warp_id = threadIdx.x / 32;
-    int lane_id = threadIdx.x % 32;
-
     // init constants
     const int d = HEAD_DIM;
     const int num_frags_d = HEAD_DIM / 16;
@@ -43,13 +40,12 @@ __global__ void flash_attn_tc_kernel(
     const half *v_base = v + qkv_offset;
     half *out_base = out + qkv_offset;
 
-    int q_row_start = (blockIdx.x * WARPS_PER_BLOCK + warp_id) * 16;
+    int q_row_start = q_block_idx * 16;
     if (q_row_start >= N)
         return;
 
     extern __shared__ float smem[];
-    float *warp_smem = &smem[warp_id * smem_per_warp];
-    float *s_smem = warp_smem;
+    float *s_smem = smem;
     half *p_smem = (half *)&s_smem[16 * 16];
     float *o_smem = (float *)&p_smem[16 * 16];
     float *row_m = &o_smem[16 * d];
