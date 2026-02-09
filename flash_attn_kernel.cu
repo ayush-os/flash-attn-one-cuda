@@ -1,3 +1,5 @@
+#include <torch/extension.h>
+#include <cuda_fp16.h>
 #include <torch/types.h>
 #include <cuda.h>
 #include <cuda_runtime.h>
@@ -176,10 +178,10 @@ torch::Tensor flash_attn_cuda_forward(torch::Tensor q, torch::Tensor k, torch::T
     size_t smem_bytes = (Br * d + 2 * Bc * d) * sizeof(half);
 
     launch_flash_attn_kernel(
-        q.data_ptr<half>(),
-        k.data_ptr<half>(),
-        v.data_ptr<half>(),
-        out.data_ptr<half>(),
+        q.data_ptr<at::half>(),
+        k.data_ptr<at::half>(),
+        v.data_ptr<at::half>(),
+        out.data_ptr<at::half>(),
         l.data_ptr<float>(),
         m.data_ptr<float>(),
         B,
