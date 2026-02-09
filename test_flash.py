@@ -40,6 +40,20 @@ def benchmark_stats(fn):
     return avg_ms, peak_mem
 
 
+def validate(custom_out, ref_out, atol=1e-5, rtol=1e-4):
+    if custom_out.shape != ref_out.shape:
+        return False, "Shape mismatch"
+
+    # Check for NaNs first - common in Flash Attention if softmax scaling is wrong
+    if torch.isnan(custom_out).any():
+        return False, "Custom output contains NaNs"
+
+    diff = (custom_out - ref_out).abs()
+    is_close = torch.allclose(custom_out, ref_out, atol=atol, rtol=rtol)
+    max_diff = diff.max().item()
+    return is_close, max_diff
+
+
 def run_sweep():
     B, nh = 4, 8
     device = torch.device("cuda")
@@ -57,6 +71,13 @@ def run_sweep():
             q = torch.randn(B, nh, N, d, device=device, dtype=dtype)
             k = torch.randn(B, nh, N, d, device=device, dtype=dtype)
             v = torch.randn(B, nh, N, d, device=device, dtype=dtype)
+
+            with torch.no_grad():
+                ref_out = scaled_dot_product_attention(q, k, v)
+                custom_out = flash_attn_lib.forward(q, k, v)
+
+            is_correct, max_err = validate(custom_out, ref_out)
+            status = "PASS" if is_correct else f"FAIL (Max Diff: {max_err:.6f})"
 
             try:
                 # Custom Kernel
