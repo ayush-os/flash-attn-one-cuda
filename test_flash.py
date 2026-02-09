@@ -24,6 +24,7 @@ def benchmark_stats(fn):
     for _ in range(50):
         fn()
     end_event.record()
+    torch.cuda.synchronize()
 
     # Memory Measurement
     torch.cuda.reset_peak_memory_stats()
