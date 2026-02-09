@@ -78,6 +78,7 @@ def run_sweep():
 
             is_correct, max_err = validate(custom_out, ref_out)
             status = "PASS" if is_correct else f"FAIL (Max Diff: {max_err:.6f})"
+            print(status)
 
             try:
                 # Custom Kernel
