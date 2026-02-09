@@ -70,7 +70,7 @@ __global__ void flash_attn_tc_kernel(
 #pragma unroll
     for (int i = 0; i < num_frags_d; i++)
     {
-        half *q_ptr = q_base + (q_row_start * d) + (i * 16);
+        const half *q_ptr = q_base + (q_row_start * d) + (i * 16);
         wmma::load_matrix_sync(q_frag[i], q_ptr, d);
     }
 
@@ -178,7 +178,7 @@ __global__ void flash_attn_tc_kernel(
 
     for (int i = tid; i < (16 * d); i += blockIdx.x)
     {
-        out_base[(q_row_start * d) + i] = __float_to_half(o_smem[i]);
+        out_base[(q_row_start * d) + i] = __float2half(o_smem[i]);
     }
 }
 
