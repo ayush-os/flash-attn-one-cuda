@@ -2,6 +2,8 @@
 #include <cuda.h>
 #include <cuda_runtime.h>
 
+#define FETCH_FLOAT4(pointer) (reinterpret_cast<const float4 *>(&(pointer))[0])
+
 template <int head_dim>
 __global__ void flash_attn_kernel(const float *__restrict__ q_ptr,
                                   const float *__restrict__ k_ptr,
@@ -17,7 +19,7 @@ __global__ void flash_attn_kernel(const float *__restrict__ q_ptr,
                                   const int Br,
                                   const float softmax_scale)
 {
-    const int d_padded = d + 1;
+    const int d_padded = d + 4;
     extern __shared__ float s[];
     float *Qi = s;
     float *Kj = &Qi[Br * d_padded];
@@ -37,37 +39,47 @@ __global__ void flash_attn_kernel(const float *__restrict__ q_ptr,
 
     int row_idx = i + threadIdx.x;
 
-    for (int idx = threadIdx.x; idx < (Br * d); idx += blockDim.x)
+    const int num_float4s = (Br * d) / 4;
+    const float4 *q_ptr_4 = reinterpret_cast<const float4 *>(q_ptr + qkv_offset);
+
+    for (int idx = threadIdx.x; idx < num_float4s; idx += blockDim.x)
     {
-        int row = idx / d;
-        int col = idx % d;
-        int q_row_idx = i + row;
-        if (q_row_idx < N)
+        int row = idx / (d / 4);
+        int col_vec = idx % (d / 4);
+        int global_row = i + row;
+        if (global_row < N)
         {
-            Qi[row * d_padded + col] = q_ptr[qkv_offset + (q_row_idx * d) + col];
+            float4 val = q_ptr_4[(global_row * (d / 4)) + col_vec];
+            reinterpret_cast<const float4 *>(&Qi[row * d_padded + col_vec * 4])[0] = val;
         }
         else
         {
-            Qi[row * d_padded + col] = 0.0f;
+            reinterpret_cast<const float4 *>(&Qi[row * d_padded + col_vec * 4])[0] = {0.f, 0.f, 0.f, 0.f};
         }
     }
 
     for (int j = 0; j < N; j += Bc)
     {
-        for (int idx = threadIdx.x; idx < (Bc * d); idx += blockDim.x)
+        const int num_float4s_kv = (Bc * d) / 4;
+        const float4 *k_ptr_4 = reinterpret_cast<const float4 *>(k_ptr + qkv_offset);
+        const float4 *v_ptr_4 = reinterpret_cast<const float4 *>(v_ptr + qkv_offset);
+
+        for (int idx = threadIdx.x; idx < num_float4s_kv; idx += blockDim.x)
         {
-            int row = idx / d;
-            int col = idx % d;
-            int col_row_idx = j + row;
-            if (col_row_idx < N)
+            int row = idx / (d / 4);
+            int col = idx % (d / 4);
+            int global_row = j + row;
+            if (global_row < N)
             {
-                Kj[row * d_padded + col] = k_ptr[qkv_offset + (j * d) + idx];
-                Vj[row * d_padded + col] = v_ptr[qkv_offset + (j * d) + idx];
+                float4 k_val = q_ptr_4[(global_row * (d / 4)) + col_vec];
+                float4 v_val = q_ptr_4[(global_row * (d / 4)) + col_vec];
+                reinterpret_cast<const float4 *>(&Kj[row * d_padded + col_vec * 4])[0] = k_val;
+                reinterpret_cast<const float4 *>(&Vj[row * d_padded + col_vec * 4])[0] = v_val;
             }
             else
             {
-                Kj[row * d_padded + col] = 0.0f;
-                Vj[row * d_padded + col] = 0.0f;
+                reinterpret_cast<float4 *>(&Kj[row * d_padded + col_vec * 4])[0] = {0.f, 0.f, 0.f, 0.f};
+                reinterpret_cast<float4 *>(&Vj[row * d_padded + col_vec * 4])[0] = {0.f, 0.f, 0.f, 0.f};
             }
         }
         __syncthreads();
@@ -80,9 +92,15 @@ __global__ void flash_attn_kernel(const float *__restrict__ q_ptr,
                     break;
 
                 float Sij = 0.f;
-                for (int jj = 0; jj < d; jj++)
+                for (int jj = 0; jj < d; jj += 4)
                 {
-                    Sij += Qi[(threadIdx.x * d_padded) + jj] * Kj[(ii * d_padded) + jj];
+                    float4 qVal = FETCH_FLOAT4(Qi[(threadIdx.x * d_padded) + jj]);
+                    float4 kVal = FETCH_FLOAT4(Kj[(ii * d_padded) + jj]);
+
+                    Sij += qVal.x * kVal.x;
+                    Sij += qVal.y * kVal.y;
+                    Sij += qVal.z * kVal.z;
+                    Sij += qVal.w * kVal.w;
                 }
                 Sij *= softmax_scale;
 
@@ -94,9 +112,14 @@ __global__ void flash_attn_kernel(const float *__restrict__ q_ptr,
 
                 li = li * alpha + beta;
 
-                for (int k = 0; k < d; k++)
+                for (int k = 0; k < d; k += 4)
                 {
-                    Oi[k] = Oi[k] * alpha + beta * Vj[ii * d_padded + k];
+                    float4 v_vec = FETCH_FLOAT4(Vj[ii * d_padded + k]);
+
+                    Oi[k] = Oi[k] * alpha + beta * v_vec.x;
+                    Oi[k + 1] = Oi[k + 1] * alpha + beta * v_vec.y;
+                    Oi[k + 2] = Oi[k + 2] * alpha + beta * v_vec.z;
+                    Oi[k + 3] = Oi[k + 3] * alpha + beta * v_vec.w;
                 }
             }
         }
@@ -111,22 +134,31 @@ __global__ void flash_attn_kernel(const float *__restrict__ q_ptr,
 
     if (row_idx < N)
     {
-        for (int k = 0; k < d; k++)
+        for (int k = 0; k < d; k += 4)
         {
-            Qi[threadIdx.x * d_padded + k] = Oi[k] / li;
+            float4 val;
+            val.x = Oi[k] / li;
+            val.y = Oi[k + 1] / li;
+            val.z = Oi[k + 2] / li;
+            val.w = Oi[k + 3] / li;
+            reinterpret_cast<float4 *>(&Qi[threadIdx.x * d_padded + k])[0] = val;
         }
     }
 
     __syncthreads();
 
-    for (int idx = threadIdx.x; idx < (Br * d); idx += blockDim.x)
+    float4 *out_ptr_4 = reinterpret_cast<float4 *>(out + qkv_offset);
+    for (int idx = threadIdx.x; idx < num_float4s; idx += blockDim.x)
     {
-        int r = idx / d;
-        int c = idx % d;
-        int global_row = i + r;
+        int row = idx / (d / 4);
+        int col_vec = idx % (d / 4);
+        int global_row = i + row;
 
         if (global_row < N)
-            out[qkv_offset + (global_row * d) + c] = Qi[r * d_padded + c];
+        {
+            float4 val = reinterpret_cast<float4 *>(&Qi[row * d_padded + col_vec * 4])[0];
+            out_ptr_4[global_row * (d / 4) + col_vec] = val;
+        }
     }
 }
 
@@ -186,7 +218,7 @@ torch::Tensor flash_attn_cuda_forward(torch::Tensor q, torch::Tensor k, torch::T
     size_t max_sram = props.sharedMemPerBlock;
 
     int Br = 64;
-    int d_padded = d + 1;
+    int d_padded = d + 4;
 
     int remaining_sram = max_sram - (Br * d_padded * sizeof(float));
     int Bc = remaining_sram / (2 * d_padded * sizeof(float));
