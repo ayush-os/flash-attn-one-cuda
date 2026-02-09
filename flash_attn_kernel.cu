@@ -22,93 +22,72 @@ __global__ void flash_attn_kernel(const float *__restrict__ q_ptr,
     float *Kj = &Qi[Br * d];
     float *Vj = &Kj[Bc * d];
 
-    int qkv_offset = (blockIdx.x * nh * N * d) + (blockIdx.y * N * d);
-    int lm_offset = (blockIdx.x * nh * N) + (blockIdx.y * N);
+    // Parallelize across Batch, Head, and Sequence Chunk
+    int b = blockIdx.x;
+    int h = blockIdx.y;
+    int i = blockIdx.z * Br; // Current row offset
+    int tid = threadIdx.x;
+    int row_idx = i + tid;
 
-    for (int i = 0; i < N; i += Br)
-    {
-        float Oi[head_dim];
-        float li = 0.0f;
-        float mi = -INFINITY;
+    int qkv_offset = (b * nh * N * d) + (h * N * d);
+    int lm_offset = (b * nh * N) + (h * N);
 
-        for (int i = 0; i < d; i++)
-            Oi[i] = 0.0f;
+    // Local registers for this thread's row
+    float Oi[head_dim] = {0.0f};
+    float li = 0.0f;
+    float mi = -INFINITY;
 
-        int row_idx = i + threadIdx.x;
-
-        if (row_idx < N)
-        {
-            const float *q_row_ptr = q_ptr + qkv_offset + (row_idx * d);
-            for (int j = 0; j < d; j++)
-            {
-                Qi[threadIdx.x * d + j] = q_row_ptr[j];
-            }
+    // Load Q row into shared memory once
+    if (row_idx < N) {
+        for (int j = 0; j < d; j++) {
+            Qi[tid * d + j] = q_ptr[qkv_offset + (row_idx * d) + j];
         }
-        else
-        {
-            for (int j = 0; j < d; j++)
-            {
-                Qi[threadIdx.x * d + j] = 0.0f;
+    }
+
+    for (int j = 0; j < N; j += Bc) {
+        // Load K, V tiles into shared memory (collaborative load)
+        for (int idx = tid; idx < (Bc * d); idx += blockDim.x) {
+            int col_row_idx = j + (idx / d);
+            if (col_row_idx < N) {
+                Kj[idx] = k_ptr[qkv_offset + (j * d) + idx];
+                Vj[idx] = v_ptr[qkv_offset + (j * d) + idx];
+            } else {
+                Kj[idx] = 0.0f;
+                Vj[idx] = 0.0f;
             }
-        }
-
-        for (int j = 0; j < N; j += Bc)
-        {
-            for (int idx = threadIdx.x; idx < (Bc * d); idx += blockDim.x)
-            {
-                int col_row_idx = j + (idx / d);
-                if (col_row_idx < N)
-                {
-                    Kj[idx] = k_ptr[qkv_offset + (j * d) + idx];
-                    Vj[idx] = v_ptr[qkv_offset + (j * d) + idx];
-                }
-                else
-                {
-                    Kj[idx] = 0.0f;
-                    Vj[idx] = 0.0f;
-                }
-            }
-            __syncthreads();
-
-            if (row_idx < N)
-            {
-                for (int ii = 0; ii < Bc; ii++)
-                {
-                    float Sij = 0.f;
-                    for (int jj = 0; jj < d; jj++)
-                    {
-                        Sij += Qi[(threadIdx.x * d) + jj] * Kj[(ii * d) + jj];
-                    }
-                    Sij *= softmax_scale;
-
-                    float old_mi = mi;
-                    mi = max(old_mi, Sij);
-
-                    float alpha = expf(old_mi - mi);
-                    float beta = expf(Sij - mi);
-
-                    li = li * alpha + beta;
-
-                    for (int k = 0; k < d; k++)
-                    {
-                        Oi[k] = Oi[k] * alpha + beta * Vj[ii * d + k];
-                    }
-                }
-            }
-            __syncthreads();
-        }
-
-        if (row_idx < N)
-        {
-            float *out_row_ptr = out + qkv_offset + (row_idx * d);
-            for (int k = 0; k < d; k++)
-            {
-                out_row_ptr[k] = Oi[k] / li;
-            }
-            l[lm_offset + row_idx] = li;
-            m[lm_offset + row_idx] = mi;
         }
         __syncthreads();
+
+        // Compute attention for this tile
+        if (row_idx < N) {
+            for (int col = 0; col < Bc && (j + col) < N; col++) {
+                float Sij = 0.0f;
+                for (int jj = 0; jj < d; jj++) {
+                    Sij += Qi[tid * d + jj] * Kj[col * d + jj];
+                }
+                Sij *= softmax_scale;
+
+                float mi_old = mi;
+                mi = max(mi_old, Sij);
+                float alpha = expf(mi_old - mi);
+                float beta = expf(Sij - mi);
+
+                li = li * alpha + beta;
+                for (int k = 0; k < d; k++) {
+                    Oi[k] = Oi[k] * alpha + beta * Vj[col * d + k];
+                }
+            }
+        }
+        __syncthreads();
+    }
+
+    // Final write-back
+    if (row_idx < N) {
+        for (int k = 0; k < d; k++) {
+            out[qkv_offset + (row_idx * d) + k] = Oi[k] / li;
+        }
+        l[lm_offset + row_idx] = li;
+        m[lm_offset + row_idx] = mi;
     }
 }
 
@@ -170,7 +149,7 @@ torch::Tensor flash_attn_cuda_forward(torch::Tensor q, torch::Tensor k, torch::T
     torch::Tensor l = torch::zeros({B, nh, N}, options);
     torch::Tensor m = torch::full({B, nh, N}, -INFINITY, options);
 
-    dim3 grid(B, nh);
+    dim3 grid(B, nh, (N + Br - 1) / Br);
     dim3 block(Br);
 
     // Size in bytes for dynamic shared memory
