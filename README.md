@@ -21,3 +21,6 @@ pip install torch numpy ninja
 ### STEP 4: RESOLVED UNCOALESCING: 9.360 (virtually no gain)
 
 ### STEP 5: VECTORIZATION: 6.318 (1.49x faster than step 4)
+
+tried moving Q into regs but way too much register pressure caused minor slowdown
+
