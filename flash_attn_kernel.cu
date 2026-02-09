@@ -167,7 +167,7 @@ torch::Tensor flash_attn_cuda_forward(torch::Tensor q, torch::Tensor k, torch::T
     // Step 1: Set block sizes
     const int SRAM_SIZE = 48000;
     int Bc = std::max(1, SRAM_SIZE / (4 * (d + 1) * (int)sizeof(float)));
-    int Br = 32;
+    int Br = 128;
 
     // Step 2: Init O, l, m
     torch::Tensor out = torch::zeros_like(q);
