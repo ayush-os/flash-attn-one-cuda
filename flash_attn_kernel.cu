@@ -6,8 +6,6 @@
 
 using namespace nvcuda;
 
-#define WARP_SIZE 32
-
 // WMMA Shape Constants
 const int WMMA_M = 16;
 const int WMMA_N = 16;
@@ -46,20 +44,17 @@ __global__ void flash_attn_tc_kernel(
     if (q_row_start >= N)
         return;
 
-    // shared memory initialization
-    extern __shared__ float s[];
-    float *s_smem_f = s;
-    half *s_smem_h = reinterpret_cast<half *>(s);
-    float *o_smem = &s[16 * 16];
+    extern __shared__ float smem[];
+    float *s_smem = smem;
+    half *p_smem = (half *)&s_smem[16 * 16];
+    float *o_smem = (float *)&p_smem[16 * 16];
+    float *row_m = &o_smem[16 * d];
+    float *row_l = &row_m[16];
 
     for (int i = tid; i < 16 * d; i += blockDim.x)
     {
         o_smem[i] = 0.0f;
     }
-
-    float *row_m = &o_smem[16 * d];
-    float *row_l = &row_m[16];
-
     if (tid < 16)
     {
         row_m[tid] = -1e20f;
@@ -94,7 +89,7 @@ __global__ void flash_attn_tc_kernel(
         }
 
         // store to S
-        wmma::store_matrix_sync(s_smem_f, s_acc, 16, wmma::mem_row_major);
+        wmma::store_matrix_sync(s_smem, s_acc, 16, wmma::mem_row_major);
         __syncthreads();
 
         // softmax
@@ -107,10 +102,10 @@ __global__ void flash_attn_tc_kernel(
 
             for (int c = 0; c < 16; c++)
             {
-                float val = s_smem_f[row * 16 + c] * softmax_scale;
+                float val = s_smem[row * 16 + c] * softmax_scale;
                 if (val > local_max)
                     local_max = val;
-                s_smem_f[row * 16 + c] = val;
+                s_smem[row * 16 + c] = val;
             }
 
             // update stats
@@ -122,10 +117,10 @@ __global__ void flash_attn_tc_kernel(
             float local_sum = 0.0f;
             for (int c = 0; c < 16; c++)
             {
-                float val = s_smem_f[row * 16 + c];
+                float val = s_smem[row * 16 + c];
                 float p = expf(val - m_curr);
 
-                s_smem_h[row * 16 + c] = __float2half(p);
+                p_smem[row * 16 + c] = __float2half(p);
 
                 local_sum += p;
             }
@@ -148,7 +143,7 @@ __global__ void flash_attn_tc_kernel(
 
         // multiply P by V
         wmma::fragment<wmma::matrix_a, WMMA_M, WMMA_N, WMMA_K, half, wmma::row_major> p_frag;
-        wmma::load_matrix_sync(p_frag, s_smem_h, 16);
+        wmma::load_matrix_sync(p_frag, p_smem, 16);
         for (int k_idx = 0; k_idx < num_frags_d; k_idx++)
         {
             const half *v_ptr = v_base + j * d + k_idx * 16;
@@ -203,11 +198,12 @@ void launch_flash_attn_tc(
     dim3 grid(N / 16, nh, B);
     dim3 block(32); // 1 Warp per block
 
-    // Shared Memory Calculation
-    // s_smem (float): 16*16*4 = 1024 bytes
-    // o_smem (float): 16*d*4 bytes
-    // row_stats (float): 16*2*4 = 128 bytes
-    size_t smem_size = 1024 + (16 * d * sizeof(float)) + 128;
+    // Shared Memory Size Calculation
+    // S (float): 16*16*4 = 1024 bytes
+    // P (half):  16*16*2 = 512 bytes
+    // O (float): 16*d*4 bytes
+    // Stats: 128 bytes
+    size_t smem_size = 1024 + 512 + (16 * d * sizeof(float)) + 128;
 
     if (d == 32)
     {
