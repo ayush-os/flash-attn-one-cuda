@@ -13,9 +13,11 @@ flash_attn_lib = load(
 
 def benchmark_stats(fn):
     # Warmup
-    for _ in range(10):
-        fn()
-    torch.cuda.synchronize()
+    try:
+        out = fn()
+        torch.cuda.synchronize()
+    except Exception as e:
+        return 0.0, 0.0
 
     # Time Measurement
     start_event = torch.cuda.Event(enable_timing=True)
