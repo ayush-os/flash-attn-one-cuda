@@ -13,10 +13,12 @@ flash_attn_lib = load(
 
 def benchmark_stats(fn):
     # Warmup
+    torch.cuda.synchronize()
     try:
-        out = fn()
+        _ = fn()
         torch.cuda.synchronize()
     except Exception as e:
+        print(f"Kernel execution failed: {e}")
         return 0.0, 0.0
 
     # Time Measurement

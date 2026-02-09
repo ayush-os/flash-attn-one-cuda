@@ -164,12 +164,21 @@ torch::Tensor flash_attn_cuda_forward(torch::Tensor q, torch::Tensor k, torch::T
 
     auto options = torch::TensorOptions().dtype(q.dtype()).device(q.device());
 
-    // Step 1: Set block sizes
-    const int SRAM_SIZE = 48000;
-    int Bc = std::max(1, SRAM_SIZE / (4 * (d + 1) * (int)sizeof(float)));
-    int Br = 128;
+    int device_id;
+    cudaGetDevice(&device_id);
+    cudaDeviceProp props;
+    cudaGetDeviceProperties(&props, device_id);
 
-    // Step 2: Init O, l, m
+    size_t max_sram = props.sharedMemPerBlock;
+
+    int Br = 64; 
+    int d_padded = d + 1;
+
+    int remaining_sram = max_sram - (Br * d_padded * sizeof(float));
+    int Bc = remaining_sram / (2 * d_padded * sizeof(float));
+
+    Bc = std::min(Bc, N);
+
     torch::Tensor out = torch::zeros_like(q);
     torch::Tensor l = torch::zeros({B, nh, N}, options);
     torch::Tensor m = torch::full({B, nh, N}, -INFINITY, options);
@@ -177,7 +186,7 @@ torch::Tensor flash_attn_cuda_forward(torch::Tensor q, torch::Tensor k, torch::T
     dim3 grid(B, nh, (N + Br - 1) / Br);
     dim3 block(Br);
 
-    size_t smem_bytes = (Br * (d + 1) + 2 * Bc * (d + 1)) * sizeof(float);
+    size_t smem_bytes = (Br * d_padded + 2 * Bc * d_padded) * sizeof(float);
 
     launch_flash_attn_kernel(
         q.data_ptr<float>(),
@@ -196,6 +205,11 @@ torch::Tensor flash_attn_cuda_forward(torch::Tensor q, torch::Tensor k, torch::T
         grid,
         block,
         smem_bytes);
+
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        printf("CUDA kernel failed: %s\n", cudaGetErrorString(err));
+    }
 
     return out;
 }
