@@ -49,12 +49,12 @@ __global__ void flash_attn_kernel(const float *__restrict__ q_ptr,
         int global_row = i + row;
         if (global_row < N)
         {
-            float4 val = q_ptr_4[(global_row * (d / 4)) + col_vec];
-            reinterpret_cast<const float4 *>(&Qi[row * d_padded + col_vec * 4])[0] = val;
+            float4 val = q_ptr_4[global_row * (d / 4) + col_vec];
+            reinterpret_cast<float4 *>(&Qi[row * d_padded + col_vec * 4])[0] = val;
         }
         else
         {
-            reinterpret_cast<const float4 *>(&Qi[row * d_padded + col_vec * 4])[0] = {0.f, 0.f, 0.f, 0.f};
+            reinterpret_cast<float4 *>(&Qi[row * d_padded + col_vec * 4])[0] = {0.f, 0.f, 0.f, 0.f};
         }
     }
 
@@ -67,14 +67,14 @@ __global__ void flash_attn_kernel(const float *__restrict__ q_ptr,
         for (int idx = threadIdx.x; idx < num_float4s_kv; idx += blockDim.x)
         {
             int row = idx / (d / 4);
-            int col = idx % (d / 4);
+            int col_vec = idx % (d / 4);
             int global_row = j + row;
             if (global_row < N)
             {
                 float4 k_val = q_ptr_4[(global_row * (d / 4)) + col_vec];
                 float4 v_val = q_ptr_4[(global_row * (d / 4)) + col_vec];
-                reinterpret_cast<const float4 *>(&Kj[row * d_padded + col_vec * 4])[0] = k_val;
-                reinterpret_cast<const float4 *>(&Vj[row * d_padded + col_vec * 4])[0] = v_val;
+                reinterpret_cast<float4 *>(&Kj[row * d_padded + col_vec * 4])[0] = k_val;
+                reinterpret_cast<float4 *>(&Vj[row * d_padded + col_vec * 4])[0] = v_val;
             }
             else
             {
