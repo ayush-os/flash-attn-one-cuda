@@ -107,8 +107,8 @@ def run_benchmark_mode():
 
 
 if __name__ == "__main__":
-    # If you pass '--profile' as an argument, run the minimal set for NCU
     if len(sys.argv) > 1 and sys.argv[1] == "--profile":
         run_profile_mode()
+        sys.exit(0)
     else:
         run_benchmark_mode()
