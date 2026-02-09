@@ -17,10 +17,11 @@ __global__ void flash_attn_kernel(const float *__restrict__ q_ptr,
                                   const int Br,
                                   const float softmax_scale)
 {
+    const int d_padded = d + 1; 
     extern __shared__ float s[];
     float *Qi = s;
-    float *Kj = &Qi[Br * d];
-    float *Vj = &Kj[Bc * d];
+    float *Kj = &Qi[Br * d_padded];
+    float *Vj = &Kj[Bc * d_padded];
 
     int qkv_offset = (blockIdx.x * nh * N * d) + (blockIdx.y * N * d);
     int lm_offset = (blockIdx.x * nh * N) + (blockIdx.y * N);
@@ -40,14 +41,14 @@ __global__ void flash_attn_kernel(const float *__restrict__ q_ptr,
     {
         for (int j = 0; j < d; j++)
         {
-            Qi[threadIdx.x * d + j] = q_ptr[qkv_offset + (row_idx * d) + j];
+            Qi[threadIdx.x * d_padded + j] = q_ptr[qkv_offset + (row_idx * d) + j];
         }
     }
     else
     {
         for (int j = 0; j < d; j++)
         {
-            Qi[threadIdx.x * d + j] = 0.0f;
+            Qi[threadIdx.x * d_padded + j] = 0.0f;
         }
     }
 
@@ -55,16 +56,18 @@ __global__ void flash_attn_kernel(const float *__restrict__ q_ptr,
     {
         for (int idx = threadIdx.x; idx < (Bc * d); idx += blockDim.x)
         {
-            int col_row_idx = j + (idx / d);
+            int row = idx / d;
+            int col = idx % d;
+            int col_row_idx = j + row;
             if (col_row_idx < N)
             {
-                Kj[idx] = k_ptr[qkv_offset + (j * d) + idx];
-                Vj[idx] = v_ptr[qkv_offset + (j * d) + idx];
+                Kj[row * d_padded + col] = k_ptr[qkv_offset + (j * d) + idx];
+                Vj[row * d_padded + col] = v_ptr[qkv_offset + (j * d) + idx];
             }
             else
             {
-                Kj[idx] = 0.0f;
-                Vj[idx] = 0.0f;
+                Kj[row * d_padded + col] = 0.0f;
+                Vj[row * d_padded + col] = 0.0f;
             }
         }
         __syncthreads();
@@ -80,7 +83,7 @@ __global__ void flash_attn_kernel(const float *__restrict__ q_ptr,
                 float Sij = 0.f;
                 for (int jj = 0; jj < d; jj++)
                 {
-                    Sij += Qi[(threadIdx.x * d) + jj] * Kj[(ii * d) + jj];
+                    Sij += Qi[(threadIdx.x * d_padded) + jj] * Kj[(ii * d_padded) + jj];
                 }
                 Sij *= softmax_scale;
 
@@ -94,7 +97,7 @@ __global__ void flash_attn_kernel(const float *__restrict__ q_ptr,
 
                 for (int k = 0; k < d; k++)
                 {
-                    Oi[k] = Oi[k] * alpha + beta * Vj[ii * d + k];
+                    Oi[k] = Oi[k] * alpha + beta * Vj[ii * d_padded + k];
                 }
             }
         }
@@ -163,7 +166,7 @@ torch::Tensor flash_attn_cuda_forward(torch::Tensor q, torch::Tensor k, torch::T
 
     // Step 1: Set block sizes
     const int SRAM_SIZE = 48000;
-    int Bc = std::max(1, SRAM_SIZE / (4 * d * (int)sizeof(float)));
+    int Bc = std::max(1, SRAM_SIZE / (4 * (d + 1) * (int)sizeof(float)));
     int Br = 32;
 
     // Step 2: Init O, l, m
@@ -174,10 +177,7 @@ torch::Tensor flash_attn_cuda_forward(torch::Tensor q, torch::Tensor k, torch::T
     dim3 grid(B, nh, (N + Br - 1) / Br);
     dim3 block(Br);
 
-    // Size in bytes for dynamic shared memory
-    // Q_tile (Br * d) + K_tile (Bc * d) + V_tile (Bc * d)
-    // O, l, m will be stored in regs
-    size_t smem_bytes = (Br * d + 2 * Bc * d) * sizeof(float);
+    size_t smem_bytes = (Br * (d + 1) + 2 * Bc * (d + 1)) * sizeof(float);
 
     launch_flash_attn_kernel(
         q.data_ptr<float>(),
