@@ -77,9 +77,8 @@ __global__ void flash_attn_kernel(const float *__restrict__ q_ptr,
             for (int ii = 0; ii < Bc; ii++)
             {
                 if ((j + ii) >= N)
-                {
                     break;
-                }
+
                 float Sij = 0.f;
                 for (int jj = 0; jj < d; jj++)
                 {
@@ -106,13 +105,28 @@ __global__ void flash_attn_kernel(const float *__restrict__ q_ptr,
 
     if (row_idx < N)
     {
-        float *out_row_ptr = out + qkv_offset + (row_idx * d);
-        for (int k = 0; k < d; k++)
-        {
-            out_row_ptr[k] = Oi[k] / li;
-        }
         l[lm_offset + row_idx] = li;
         m[lm_offset + row_idx] = mi;
+    }
+
+    if (row_idx < N)
+    {
+        for (int k = 0; k < d; k++)
+        {
+            Qi[threadIdx.x * d_padded + k] = Oi[k] / li;
+        }
+    }
+
+    __syncthreads();
+
+    for (int idx = threadIdx.x; idx < (Br * d); idx += blockDim.x)
+    {
+        int r = idx / d;
+        int c = idx % d;
+        int global_row = i + r;
+
+        if (global_row < N)
+            out[qkv_offset + (global_row * d) + c] = Qi[r * d_padded + c];
     }
 }
 
@@ -171,7 +185,7 @@ torch::Tensor flash_attn_cuda_forward(torch::Tensor q, torch::Tensor k, torch::T
 
     size_t max_sram = props.sharedMemPerBlock;
 
-    int Br = 64; 
+    int Br = 64;
     int d_padded = d + 1;
 
     int remaining_sram = max_sram - (Br * d_padded * sizeof(float));
@@ -207,7 +221,8 @@ torch::Tensor flash_attn_cuda_forward(torch::Tensor q, torch::Tensor k, torch::T
         smem_bytes);
 
     cudaError_t err = cudaGetLastError();
-    if (err != cudaSuccess) {
+    if (err != cudaSuccess)
+    {
         printf("CUDA kernel failed: %s\n", cudaGetErrorString(err));
     }
 
