@@ -3,22 +3,8 @@
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
 #include <mma.h>
-#include <cuda_pipeline.h> // Required for pipeline primitives
 
 using namespace nvcuda;
-
-// --- Helper for cp.async ---
-// Copies 16 bytes (float4 * 2 or half * 8) from global to shared
-__device__ __forceinline__ void cp_async4(void *smem_ptr, const void *glob_ptr)
-{
-    const int BYTES = 16;
-    uint32_t smem_addr = static_cast<uint32_t>(__cvta_generic_to_shared(smem_ptr));
-    asm volatile(
-        "cp.async.ca.shared.global [%0], [%1], %2;\n"
-        :
-        : "r"(smem_addr), "l"(glob_ptr), "n"(BYTES)
-        : "memory");
-}
 
 // --- Tuning Parameters ---
 #define WARP_SIZE 32
@@ -27,7 +13,7 @@ const int WMMA_N = 16;
 const int WMMA_K = 16;
 
 template <int HEAD_DIM>
-__global__ void flash_attn_cp_async_kernel(
+__global__ void flash_attn_tc_kernel(
     const half *__restrict__ q,
     const half *__restrict__ k,
     const half *__restrict__ v,
@@ -37,16 +23,18 @@ __global__ void flash_attn_cp_async_kernel(
     const int N,
     const float softmax_scale)
 {
-    const int d = HEAD_DIM;
+    // The number of 16-wide fragments needed to cover dimension d
     const int num_frags_d = HEAD_DIM / 16;
+    const int d = HEAD_DIM;
 
-    // Grid Indexing
+    // --- Indexing ---
     int batch_idx = blockIdx.z;
     int head_idx = blockIdx.y;
-    int q_block_idx = blockIdx.x;
+    int q_block_idx = blockIdx.x; // Block index for Q rows
+
     int tid = threadIdx.x;
 
-    // --- Memory Offsets ---
+    // Base Offsets
     long long qkv_offset = (long long)batch_idx * nh * N * d + (long long)head_idx * N * d;
     const half *q_base = q + qkv_offset;
     const half *k_base = k + qkv_offset;
@@ -57,57 +45,35 @@ __global__ void flash_attn_cp_async_kernel(
     if (q_row_start >= N)
         return;
 
-    // --- Shared Memory Layout ---
-    // 1. K_Smem: 2 buffers (Ping-Pong) x 16 rows x d cols
-    // 2. V_Smem: 2 buffers (Ping-Pong) x 16 rows x d cols
-    // 3. S_Smem: 1 buffer 16x16 (Float for scores, Half for P)
-    // 4. O_Smem: 1 buffer 16xd (Float accumulator)
-    // 5. Stats:  1 buffer 16x2 (Float)
+    // --- Shared Memory ---
+    // s_smem: Stores scores (S) and later probabilities (P).
+    // o_smem: Stores output accumulators (O).
+    extern __shared__ float smem[];
+    float *s_smem_f = smem;                          // Float view for Score Accumulation
+    half *s_smem_h = reinterpret_cast<half *>(smem); // Half view for P matrix (aliased)
+    float *o_smem = &smem[16 * 16];                  // Float view for O Accumulation
 
-    extern __shared__ char smem_raw[];
-
-    // Pointers
-    half *k_smem[2];
-    half *v_smem[2];
-    float *s_smem_f;
-    half *s_smem_h;
-    float *o_smem;
-    float *row_m;
-    float *row_l;
-
-    // Layout Calculation
-    // k_tile_sz = 16 * d * sizeof(half)
-    size_t k_tile_sz = 16 * d * sizeof(half);
-
-    k_smem[0] = (half *)(smem_raw);
-    k_smem[1] = (half *)(smem_raw + k_tile_sz);
-    v_smem[0] = (half *)(smem_raw + 2 * k_tile_sz);
-    v_smem[1] = (half *)(smem_raw + 3 * k_tile_sz);
-
-    size_t offset_so = 4 * k_tile_sz;
-
-    s_smem_f = (float *)(smem_raw + offset_so);
-    s_smem_h = (half *)(s_smem_f);          // Alias
-    o_smem = (float *)(s_smem_f + 16 * 16); // 16*16 floats
-    row_m = (float *)(o_smem + 16 * d);     // 16*d floats
-    row_l = (float *)(row_m + 16);          // 16 floats
-
-    // Initialize Output Accumulator
+    // Initialize O accumulator in Shared Memory
     for (int i = tid; i < 16 * d; i += blockDim.x)
     {
         o_smem[i] = 0.0f;
     }
 
-    // Initialize Stats
+    // Row Statistics (Max m, Sum l)
+    float *row_m = &o_smem[16 * d];
+    float *row_l = &row_m[16];
+
     if (tid < 16)
     {
-        row_m[tid] = -1e20f;
+        row_m[tid] = -1e20f; // -inf
         row_l[tid] = 0.0f;
     }
     __syncthreads();
 
-    // --- Load Q (Once, held in registers) ---
+    // --- Register Fragments ---
+    // Q is constant for the whole loop, load once.
     wmma::fragment<wmma::matrix_a, WMMA_M, WMMA_N, WMMA_K, half, wmma::row_major> q_frag[HEAD_DIM / 16];
+
 #pragma unroll
     for (int i = 0; i < num_frags_d; i++)
     {
@@ -115,112 +81,96 @@ __global__ void flash_attn_cp_async_kernel(
         wmma::load_matrix_sync(q_frag[i], ptr, d);
     }
 
-    // --- Software Pipeline Prologue ---
-    // Kick off load for Tile 0 into Buffer 0
+    // Double Buffering Registers for K and V
+    // "curr" holds data for iteration j
+    // "next" holds data for iteration j+16
+    wmma::fragment<wmma::matrix_b, WMMA_M, WMMA_N, WMMA_K, half, wmma::col_major> k_frag_curr[HEAD_DIM / 16];
+    wmma::fragment<wmma::matrix_b, WMMA_M, WMMA_N, WMMA_K, half, wmma::col_major> k_frag_next[HEAD_DIM / 16];
+
+    wmma::fragment<wmma::matrix_b, WMMA_M, WMMA_N, WMMA_K, half, wmma::row_major> v_frag_curr[HEAD_DIM / 16];
+    wmma::fragment<wmma::matrix_b, WMMA_M, WMMA_N, WMMA_K, half, wmma::row_major> v_frag_next[HEAD_DIM / 16];
+
+// --- Prologue: Load first tile (j=0) ---
+#pragma unroll
+    for (int i = 0; i < num_frags_d; i++)
     {
-        const half *k_src = k_base; // j=0
-        const half *v_src = v_base; // j=0
-        half *k_dst = k_smem[0];
-        half *v_dst = v_smem[0];
+        // Load K0 (Transposed)
+        const half *k_ptr = k_base + 0 * d + i * 16;
+        wmma::load_matrix_sync(k_frag_curr[i], k_ptr, d);
 
-        // Each thread loads 8 halves (16 bytes) at a time
-        // Total elements to load: 16 * d
-        // Threads: 32. Total capacity per step: 32 * 8 = 256 elems.
-        // For d=64, total = 1024 elems. Loops = 4.
-
-        for (int i = tid * 8; i < 16 * d; i += blockDim.x * 8)
-        {
-            cp_async4(&k_dst[i], &k_src[i]);
-            cp_async4(&v_dst[i], &v_src[i]);
-        }
-        // Commit group 0
-        asm volatile("cp.async.commit_group;\n" ::);
+        // Load V0
+        const half *v_ptr = v_base + 0 * d + i * 16;
+        wmma::load_matrix_sync(v_frag_curr[i], v_ptr, d);
     }
 
     // --- Main Loop ---
-    int cur_stage = 0;
-    int next_stage = 1;
-
     for (int j = 0; j < N; j += 16)
     {
 
-        // 1. Wait for data to arrive for `cur_stage`
-        // We wait for all groups except the last N (which is 0 in prologue, but grows).
-        // Actually, simpler logic: wait_group N-1? No, we commit every step.
-        // We want 1 stage visible.
-        asm volatile("cp.async.wait_group 0;\n" ::);
-        __syncthreads(); // Memory visible to all threads in block
-
-        // 2. Kick off Load for `next_stage` (j + 16)
+        // 1. Prefetch Next Tile (j + 16)
+        // Issue loads *before* doing the heavy math for the current tile.
+        // The latency of these loads will be hidden by the MMA instructions below.
         int next_j = j + 16;
-        if (next_j < N)
-        {
-            const half *k_src = k_base + next_j * d;
-            const half *v_src = v_base + next_j * d;
-            half *k_dst = k_smem[next_stage];
-            half *v_dst = v_smem[next_stage];
+        bool next_exists = (next_j < N);
 
-            for (int i = tid * 8; i < 16 * d; i += blockDim.x * 8)
+        if (next_exists)
+        {
+#pragma unroll
+            for (int i = 0; i < num_frags_d; i++)
             {
-                cp_async4(&k_dst[i], &k_src[i]);
-                cp_async4(&v_dst[i], &v_src[i]);
+                const half *k_ptr = k_base + next_j * d + i * 16;
+                wmma::load_matrix_sync(k_frag_next[i], k_ptr, d);
+
+                const half *v_ptr = v_base + next_j * d + i * 16;
+                wmma::load_matrix_sync(v_frag_next[i], v_ptr, d);
             }
-            // Commit this new fetch as a new group
-            asm volatile("cp.async.commit_group;\n" ::);
         }
 
-        // 3. Compute using `cur_stage` (Data is in Shared Mem)
-
-        // A. Compute S = Q * K_cur^T
+        // 2. Compute S = Q * K_curr^T
         wmma::fragment<wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, float> s_acc;
         wmma::fill_fragment(s_acc, 0.0f);
 
 #pragma unroll
         for (int k_idx = 0; k_idx < num_frags_d; k_idx++)
         {
-            // Load K fragment from Shared Mem (Buffer `cur_stage`)
-            // K needs to be transposed. WMMA Col Major load does this.
-            wmma::fragment<wmma::matrix_b, WMMA_M, WMMA_N, WMMA_K, half, wmma::col_major> k_frag;
-
-            // Ptr to the specific 16x16 tile in the 16xd K matrix
-            half *ptr = k_smem[cur_stage] + k_idx * 16;
-
-            // Note: Stride is 'd' because K_smem is [16, d]
-            wmma::load_matrix_sync(k_frag, ptr, d);
-
-            wmma::mma_sync(s_acc, q_frag[k_idx], k_frag, s_acc);
+            wmma::mma_sync(s_acc, q_frag[k_idx], k_frag_curr[k_idx], s_acc);
         }
 
-        // Store S to Shared Mem (Float)
+        // Store Scores to Shared Memory
         wmma::store_matrix_sync(s_smem_f, s_acc, 16, wmma::mem_row_major);
         __syncthreads();
 
-        // B. Softmax Update (Standard)
+        // 3. Softmax & Online Output Update
         if (tid < 16)
         {
             int row = tid;
+
+            // Find Max
             float local_max = -1e20f;
             for (int c = 0; c < 16; c++)
             {
                 float val = s_smem_f[row * 16 + c] * softmax_scale;
                 if (val > local_max)
                     local_max = val;
-                s_smem_f[row * 16 + c] = val;
+                s_smem_f[row * 16 + c] = val; // Optimization: store scaled value
             }
 
+            // Update Stats
             float m_prev = row_m[row];
             float l_prev = row_l[row];
             float m_curr = max(m_prev, local_max);
 
+            // Compute Exp & Sum
             float local_sum = 0.0f;
             for (int c = 0; c < 16; c++)
             {
                 float val = s_smem_f[row * 16 + c];
                 float p = expf(val - m_curr);
-                s_smem_h[row * 16 + c] = __float2half(p);
+                s_smem_h[row * 16 + c] = __float2half(p); // Store P
                 local_sum += p;
             }
 
+            // Rescale O if max changed
             if (m_prev != m_curr)
             {
                 float o_scale = expf(m_prev - m_curr);
@@ -229,40 +179,47 @@ __global__ void flash_attn_cp_async_kernel(
                     o_smem[row * d + c] *= o_scale;
                 }
             }
+
             row_m[row] = m_curr;
             row_l[row] = l_prev * expf(m_prev - m_curr) + local_sum;
         }
         __syncthreads();
 
-        // C. Compute O += P * V_cur
+        // 4. Compute O += P * V_curr
+        // Load P (Matrix A)
         wmma::fragment<wmma::matrix_a, WMMA_M, WMMA_N, WMMA_K, half, wmma::row_major> p_frag;
         wmma::load_matrix_sync(p_frag, s_smem_h, 16);
 
+// Accumulate
 #pragma unroll
         for (int k_idx = 0; k_idx < num_frags_d; k_idx++)
         {
-            // Load V fragment from Shared Mem (Buffer `cur_stage`)
-            wmma::fragment<wmma::matrix_b, WMMA_M, WMMA_N, WMMA_K, half, wmma::row_major> v_frag;
-
-            half *v_ptr = v_smem[cur_stage] + k_idx * 16;
-            wmma::load_matrix_sync(v_frag, v_ptr, d);
-
+            // Load O accumulator from Shared Memory
             float *o_ptr = o_smem + k_idx * 16;
             wmma::fragment<wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, float> o_frag;
             wmma::load_matrix_sync(o_frag, o_ptr, d, wmma::mem_row_major);
 
-            wmma::mma_sync(o_frag, p_frag, v_frag, o_frag);
+            // O += P * V
+            wmma::mma_sync(o_frag, p_frag, v_frag_curr[k_idx], o_frag);
+
+            // Store back
             wmma::store_matrix_sync(o_ptr, o_frag, d, wmma::mem_row_major);
         }
         __syncthreads();
 
-        // 4. Swap Stages
-        // If we are at the last step, we don't need to swap, but logic holds.
-        cur_stage = 1 - cur_stage;
-        next_stage = 1 - next_stage;
+        // 5. Shift "Next" to "Current" for next iteration
+        if (next_exists)
+        {
+#pragma unroll
+            for (int i = 0; i < num_frags_d; i++)
+            {
+                k_frag_curr[i] = k_frag_next[i];
+                v_frag_curr[i] = v_frag_next[i];
+            }
+        }
     }
 
-    // --- Finalize ---
+    // --- Finalize & Write Output ---
     if (tid < 16)
     {
         int row = tid;
@@ -274,7 +231,6 @@ __global__ void flash_attn_cp_async_kernel(
     }
     __syncthreads();
 
-    // Write Output
     for (int i = tid; i < 16 * d; i += blockDim.x)
     {
         out_base[q_row_start * d + i] = __float2half(o_smem[i]);
@@ -301,35 +257,23 @@ void launch_flash_attn_tc(
     dim3 grid(N / 16, nh, B);
     dim3 block(32);
 
-    // Calculate Shared Mem Size
-    // K: 2 * 16 * d * 2 bytes
-    // V: 2 * 16 * d * 2 bytes
-    // S: 16 * 16 * 4 bytes
-    // O: 16 * d * 4 bytes
-    // Stats: 16 * 2 * 4 bytes
-    size_t k_sz = 2 * 16 * d * sizeof(half);
-    size_t v_sz = 2 * 16 * d * sizeof(half);
-    size_t s_sz = 16 * 16 * sizeof(float);
-    size_t o_sz = 16 * d * sizeof(float);
-    size_t stats_sz = 16 * 2 * sizeof(float);
-
-    size_t smem_size = k_sz + v_sz + s_sz + o_sz + stats_sz;
+    size_t smem_size = 1024 + (16 * d * sizeof(float)) + 128;
 
     if (d == 32)
     {
-        flash_attn_cp_async_kernel<32><<<grid, block, smem_size>>>(
+        flash_attn_tc_kernel<32><<<grid, block, smem_size>>>(
             (half *)q.data_ptr(), (half *)k.data_ptr(), (half *)v.data_ptr(), (half *)out.data_ptr(),
             B, nh, N, softmax_scale);
     }
     else if (d == 64)
     {
-        flash_attn_cp_async_kernel<64><<<grid, block, smem_size>>>(
+        flash_attn_tc_kernel<64><<<grid, block, smem_size>>>(
             (half *)q.data_ptr(), (half *)k.data_ptr(), (half *)v.data_ptr(), (half *)out.data_ptr(),
             B, nh, N, softmax_scale);
     }
     else if (d == 128)
     {
-        flash_attn_cp_async_kernel<128><<<grid, block, smem_size>>>(
+        flash_attn_tc_kernel<128><<<grid, block, smem_size>>>(
             (half *)q.data_ptr(), (half *)k.data_ptr(), (half *)v.data_ptr(), (half *)out.data_ptr(),
             B, nh, N, softmax_scale);
     }
