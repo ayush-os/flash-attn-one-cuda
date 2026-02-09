@@ -43,3 +43,8 @@ next optimizations to look into if i wasn't sick of this kernel at this point:
 - k/v through shared mmory
 - keep O accumulators in registers
 - autotuning
+
+## interesting profile
+- still incredibly bandwidth bound - compute at 16% throughput
+- low occupancy 25%
+- not sure what the next thing to do here is
