@@ -34,11 +34,12 @@ __global__ void flash_attn_kernel(const float *__restrict__ q,
     {
         // step 8: load Qi, Oi, li, mi into sram
         int row_idx = i + threadIdx.x;
+        float *out_row_ptr;
 
         if (row_idx < N)
         {
             const float *q_row_ptr = q + qkv_offset + (row_idx * d);
-            float *out_row_ptr = out + qkv_offset + (row_idx * d);
+            out_row_ptr = out + qkv_offset + (row_idx * d);
             for (int k = 0; k < d; k++)
             {
                 Qi[threadIdx.x * d + k] = q_row_ptr[k];
@@ -77,7 +78,49 @@ __global__ void flash_attn_kernel(const float *__restrict__ q,
                 }
             }
             __syncthreads(); // at this point Kj and Vj are fully loaded
+
+            float mij = -INFINITY;
+            float lij = 0.0f;
+            // step 9: compute Sij = QiKj^T
+            for (int ii = 0; ii < Bc; ii++) {
+                float sum = 0.f;
+                for (int jj = 0; jj < d; jj++) {
+                    sum += Qi[(threadIdx.x * d) + jj] * Kj[(ii * d) + jj];
+                }
+                float Sij = sum * softmax_scale;
+
+                // step 10: compute mij, lij, Pij
+                float old_mij = mij;                
+                mij = max(mij, Sij);
+
+                float factor = expf(old_mij - mij);
+                float Pij = expf(Sij - mij)
+                lij = (lij * factor) + Pij;
+
+                // step 12: Pij to Oi
+                for (int k = 0; k < d; k++) {
+                    Oi[k] = (Oi[k] * factor) + (Pij * Vj[ii * d + k]);
+                }
+            }
+            __syncthreads(); // make sure thread does not start overwriting Kj and Vj currently in use
         }
+
+        if (row_idx < N) {
+            // step 11
+            float mi_new = max(mi, mij);
+            float factor_mi = expf(mi - mi_new);
+            float factor_mij = expf(mij - mi_new);
+            float li_new = factor_mi * li + factor_mij * lij;
+
+            l[lm_offset + row_idx] = li_new;
+            m[lm_offset + row_idx] = mi_new;
+
+            for (int k = 0; k < d; k++) {
+                out_row_ptr[k] = Oi[k] / li_new;
+            }
+        }
+
+        __syncthreads();
     }
 }
 
