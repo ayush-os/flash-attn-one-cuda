@@ -36,3 +36,5 @@ tried moving Q into regs but way too much register pressure caused minor slowdow
 
 ### STEP 7: FP32 to FP16 - 6.226 ms (seems like i lost)
 ## virtually no gain but necessary step for tensor core compatability
+
+### STEP 8: TENSOR CORES 0.894 (5.9x faster than step 6)
