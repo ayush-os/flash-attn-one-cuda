@@ -58,7 +58,7 @@ def run_sweep():
     B, nh = 4, 8
     device = torch.device("cuda")
 
-    dtype = torch.float32
+    dtype = torch.float16
 
     seq_lengths = [1024, 2048, 4096]
     head_dims = [64, 128]
@@ -76,7 +76,8 @@ def run_sweep():
                 ref_out = scaled_dot_product_attention(q, k, v)
                 custom_out = flash_attn_lib.forward(q, k, v)
 
-            is_correct, max_err = validate(custom_out, ref_out)
+            is_correct, max_err = validate(
+                custom_out, ref_out, atol=1e-3, rtol=1e-3)
             status = "PASS" if is_correct else f"FAIL (Max Diff: {max_err:.6f})"
             print(status)
 
