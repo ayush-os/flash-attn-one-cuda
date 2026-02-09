@@ -3,66 +3,66 @@
 #include <cuda_runtime.h>
 
 template <int head_dim>
-__global__ void flash_attn_kernel(const float *__restrict__ q_ptr,
-                                  const float *__restrict__ k_ptr,
-                                  const float *__restrict__ v_ptr,
-                                  float *out,
-                                  float *l,
-                                  float *m,
-                                  const int B,
-                                  const int nh,
-                                  const int N,
-                                  const int d,
-                                  const int Bc,
-                                  const int Br,
-                                  const float softmax_scale)
+__global__ void flash_attn_kernel(const float *q, const float *k, const float *v,
+                                  float *out, float *l, float *m,
+                                  const int B, const int nh, const int N, const int d,
+                                  const int Bc, const int Br, const float softmax_scale)
 {
     extern __shared__ float s[];
-    float *Qi = s;
-    float *Kj = &Qi[Br * d];
-    float *Vj = &Kj[Bc * d];
+    float *Qi = s;           // Size: Br * d
+    float *Kj = &Qi[Br * d]; // Size: Bc * d
+    float *Vj = &Kj[Bc * d]; // Size: Bc * d
 
-    // Parallelize across Batch, Head, and Sequence Chunk
-    int b = blockIdx.x;
-    int h = blockIdx.y;
-    int i = blockIdx.z * Br; // Current row offset
     int tid = threadIdx.x;
-    int row_idx = i + tid;
+    int row_idx = blockIdx.z * Br + tid;
+    int qkv_offset = (blockIdx.x * nh * N * d) + (blockIdx.y * N * d);
 
-    int qkv_offset = (b * nh * N * d) + (h * N * d);
-    int lm_offset = (b * nh * N) + (h * N);
-
-    // Local registers for this thread's row
-    float Oi[head_dim] = {0.0f};
-    float li = 0.0f;
+    // 1. Each thread tracks its own softmax stats in registers
     float mi = -INFINITY;
+    float li = 0.0f;
+    float Oi[head_dim] = {0.0f};
 
-    // Load Q row into shared memory once
-    if (row_idx < N) {
-        for (int j = 0; j < d; j++) {
-            Qi[tid * d + j] = q_ptr[qkv_offset + (row_idx * d) + j];
+    // 2. Load Q tile into shared memory (Each thread loads its own row)
+    if (row_idx < N)
+    {
+        for (int j = 0; j < d; j++)
+        {
+            Qi[tid * d + j] = q[qkv_offset + row_idx * d + j];
         }
     }
+    __syncthreads(); // Ensure Q is fully loaded
 
-    for (int j = 0; j < N; j += Bc) {
-        // Load K, V tiles into shared memory (collaborative load)
-        for (int idx = tid; idx < (Bc * d); idx += blockDim.x) {
-            int col_row_idx = j + (idx / d);
-            if (col_row_idx < N) {
-                Kj[idx] = k_ptr[qkv_offset + (j * d) + idx];
-                Vj[idx] = v_ptr[qkv_offset + (j * d) + idx];
-            } else {
+    // 3. Loop over blocks of K and V
+    for (int j = 0; j < N; j += Bc)
+    {
+        // Collaborative load of K and V into shared memory
+        for (int idx = tid; idx < (Bc * d); idx += blockDim.x)
+        {
+            int load_row = j + (idx / d);
+            if (load_row < N)
+            {
+                Kj[idx] = k[qkv_offset + load_row * d + (idx % d)];
+                Vj[idx] = v[qkv_offset + load_row * d + (idx % d)];
+            }
+            else
+            {
                 Kj[idx] = 0.0f;
                 Vj[idx] = 0.0f;
             }
         }
         __syncthreads();
 
-        // Compute attention for this tile
-        if (row_idx < N) {
-            for (int col = 0; col < Bc && (j + col) < N; col++) {
+        // 4. Compute Attention for this tile
+        if (row_idx < N)
+        {
+            for (int col = 0; col < Bc; col++)
+            {
+                if (j + col >= N)
+                    break;
+
                 float Sij = 0.0f;
-                for (int jj = 0; jj < d; jj++) {
+                for (int jj = 0; jj < d; jj++)
+                {
                     Sij += Qi[tid * d + jj] * Kj[col * d + jj];
                 }
                 Sij *= softmax_scale;
@@ -73,21 +73,25 @@ __global__ void flash_attn_kernel(const float *__restrict__ q_ptr,
                 float beta = expf(Sij - mi);
 
                 li = li * alpha + beta;
-                for (int k = 0; k < d; k++) {
-                    Oi[k] = Oi[k] * alpha + beta * Vj[col * d + k];
+                for (int p = 0; p < head_dim; p++)
+                {
+                    Oi[p] = Oi[p] * alpha + beta * Vj[col * head_dim + p];
                 }
             }
         }
-        __syncthreads();
+        __syncthreads(); // Sync before loading next K, V tile
     }
 
-    // Final write-back
-    if (row_idx < N) {
-        for (int k = 0; k < d; k++) {
-            out[qkv_offset + (row_idx * d) + k] = Oi[k] / li;
+    // 5. Finalize and Write Out
+    if (row_idx < N)
+    {
+        int lm_idx = (blockIdx.x * nh * N) + (blockIdx.y * N) + row_idx;
+        for (int p = 0; p < head_dim; p++)
+        {
+            out[qkv_offset + row_idx * d + p] = Oi[p] / li;
         }
-        l[lm_offset + row_idx] = li;
-        m[lm_offset + row_idx] = mi;
+        m[lm_idx] = mi;
+        l[lm_idx] = li;
     }
 }
 
