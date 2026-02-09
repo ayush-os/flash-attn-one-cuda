@@ -13,10 +13,9 @@ def test_accuracy_and_perf():
     B, nh, N, d = 4, 8, 1024, 64
     device = torch.device("cuda")
     
-    # Force float32 and move to GPU
-    q = torch.randn(B, nh, N, d, device=device, dtype=torch.float32)
-    k = torch.randn(B, nh, N, d, device=device, dtype=torch.float32)
-    v = torch.randn(B, nh, N, d, device=device, dtype=torch.float32)
+    q = torch.randn(B, nh, N, d, device=device, dtype=torch.float16)
+    k = torch.randn(B, nh, N, d, device=device, dtype=torch.float16)
+    v = torch.randn(B, nh, N, d, device=device, dtype=torch.float16)
 
     # --- 1. Ground Truth (PyTorch) ---
     def manual_attn(q, k, v):

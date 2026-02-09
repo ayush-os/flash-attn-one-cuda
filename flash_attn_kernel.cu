@@ -3,10 +3,10 @@
 #include <cuda_runtime.h>
 
 template <int head_dim>
-__global__ void flash_attn_kernel(const float *__restrict__ q_ptr,
-                                  const float *__restrict__ k_ptr,
-                                  const float *__restrict__ v_ptr,
-                                  float *out,
+__global__ void flash_attn_kernel(const half *__restrict__ q_ptr,
+                                  const half *__restrict__ k_ptr,
+                                  const half *__restrict__ v_ptr,
+                                  half *out,
                                   float *l,
                                   float *m,
                                   const int B,
@@ -17,10 +17,10 @@ __global__ void flash_attn_kernel(const float *__restrict__ q_ptr,
                                   const int Br,
                                   const float softmax_scale)
 {
-    extern __shared__ float s[];
-    float *Qi = s;
-    float *Kj = &Qi[Br * d];
-    float *Vj = &Kj[Bc * d];
+    extern __shared__ half s[];
+    half *Qi = s;
+    half *Kj = &Qi[Br * d];
+    half *Vj = &Kj[Bc * d];
 
     int qkv_offset = (blockIdx.x * nh * N * d) + (blockIdx.y * N * d);
     int lm_offset = (blockIdx.x * nh * N) + (blockIdx.y * N);
@@ -80,7 +80,7 @@ __global__ void flash_attn_kernel(const float *__restrict__ q_ptr,
                 float Sij = 0.f;
                 for (int jj = 0; jj < d; jj++)
                 {
-                    Sij += Qi[(threadIdx.x * d) + jj] * Kj[(ii * d) + jj];
+                    Sij += __half2float(Qi[(threadIdx.x * d) + jj]) * __half2float(Kj[(ii * d) + jj]);
                 }
                 Sij *= softmax_scale;
 
@@ -94,7 +94,7 @@ __global__ void flash_attn_kernel(const float *__restrict__ q_ptr,
 
                 for (int k = 0; k < d; k++)
                 {
-                    Oi[k] = Oi[k] * alpha + beta * Vj[ii * d + k];
+                    Oi[k] = Oi[k] * alpha + beta * __half2float(Vj[ii * d + k]);
                 }
             }
         }
@@ -103,20 +103,20 @@ __global__ void flash_attn_kernel(const float *__restrict__ q_ptr,
 
     if (row_idx < N)
     {
-        float *out_row_ptr = out + qkv_offset + (row_idx * d);
+        half *out_row_ptr = out + qkv_offset + (row_idx * d);
         for (int k = 0; k < d; k++)
         {
-            out_row_ptr[k] = Oi[k] / li;
+            out_row_ptr[k] = __float2half(Oi[k] / li);
         }
         l[lm_offset + row_idx] = li;
         m[lm_offset + row_idx] = mi;
     }
 }
 
-void launch_flash_attn_kernel(const float *q,
-                              const float *k,
-                              const float *v,
-                              float *out,
+void launch_flash_attn_kernel(const half *q,
+                              const half *k,
+                              const half *v,
+                              half *out,
                               float *l,
                               float *m,
                               int B,
@@ -163,8 +163,8 @@ torch::Tensor flash_attn_cuda_forward(torch::Tensor q, torch::Tensor k, torch::T
 
     // Step 1: Set block sizes
     const int SRAM_SIZE = 48000;
-    int Bc = std::max(1, SRAM_SIZE / (4 * d * (int)sizeof(float)));
-    int Br = 32;
+    int Bc = std::max(1, SRAM_SIZE / (4 * d * (int)sizeof(half)));
+    int Br = 64;
 
     // Step 2: Init O, l, m
     torch::Tensor out = torch::zeros_like(q);
@@ -177,13 +177,13 @@ torch::Tensor flash_attn_cuda_forward(torch::Tensor q, torch::Tensor k, torch::T
     // Size in bytes for dynamic shared memory
     // Q_tile (Br * d) + K_tile (Bc * d) + V_tile (Bc * d)
     // O, l, m will be stored in regs
-    size_t smem_bytes = (Br * d + 2 * Bc * d) * sizeof(float);
+    size_t smem_bytes = (Br * d + 2 * Bc * d) * sizeof(half);
 
     launch_flash_attn_kernel(
-        q.data_ptr<float>(),
-        k.data_ptr<float>(),
-        v.data_ptr<float>(),
-        out.data_ptr<float>(),
+        q.data_ptr<half>(),
+        k.data_ptr<half>(),
+        v.data_ptr<half>(),
+        out.data_ptr<half>(),
         l.data_ptr<float>(),
         m.data_ptr<float>(),
         B,
