@@ -3,7 +3,7 @@ import math
 from torch.utils.cpp_extension import load
 from torch.nn.functional import scaled_dot_product_attention
 
-# Load your custom kernel
+# --- Setup ---
 flash_attn_lib = load(
     name="flash_attn_lib",
     sources=["flash_attn_kernel.cu", "wrapper.cpp"],
@@ -11,58 +11,63 @@ flash_attn_lib = load(
 )
 
 
-def benchmark_fn(fn, warmup=20, iterations=100):
+def benchmark_stats(fn):
     # Warmup
-    for _ in range(warmup):
+    for _ in range(10):
         fn()
     torch.cuda.synchronize()
 
+    # Time Measurement
     start_event = torch.cuda.Event(enable_timing=True)
     end_event = torch.cuda.Event(enable_timing=True)
-
     start_event.record()
-    for _ in range(iterations):
+    for _ in range(50):
         fn()
     end_event.record()
 
+    # Memory Measurement
+    torch.cuda.reset_peak_memory_stats()
+    fn()
+    peak_mem = torch.cuda.max_memory_allocated() / (1024**2)  # Convert to MB
+
     torch.cuda.synchronize()
-    return start_event.elapsed_time(end_event) / iterations
+    avg_ms = start_event.elapsed_time(end_event) / 50
+    return avg_ms, peak_mem
 
 
 def run_sweep():
-    # Fixed parameters
     B, nh = 4, 8
     device = torch.device("cuda")
-    dtype = torch.float16  # FlashAttn is usually optimized for FP16
 
-    # Sweep parameters
-    seq_lengths = [512, 1024, 2048, 4096, 8192]
+    dtype = torch.float32
+
+    seq_lengths = [1024, 2048, 4096]
     head_dims = [64, 128]
 
-    print(f"{'SeqLen':>8} | {'HeadDim':>8} | {'Custom (ms)':>12} | {'PyTorch (ms)':>12} | {'Speedup':>8}")
-    print("-" * 65)
+    print(f"{'SeqLen':>7} | {'d':>3} | {'Custom(ms)':>10} | {'PyT(ms)':>10} | {'Speedup':>7} | {'PyT Mem(MB)':>12}")
+    print("-" * 75)
 
     for d in head_dims:
         for N in seq_lengths:
-            # Initialize tensors
             q = torch.randn(B, nh, N, d, device=device, dtype=dtype)
             k = torch.randn(B, nh, N, d, device=device, dtype=dtype)
             v = torch.randn(B, nh, N, d, device=device, dtype=dtype)
 
-            # Define functions to benchmark
-            def fn_custom(): return flash_attn_lib.forward(q, k, v)
-            def fn_pytorch(): return scaled_dot_product_attention(q, k, v)
-
-            # Measure
             try:
-                t_custom = benchmark_fn(fn_custom)
-                t_torch = benchmark_fn(fn_pytorch)
-                speedup = t_torch / t_custom
+                # Custom Kernel
+                t_custom, _ = benchmark_stats(
+                    lambda: flash_attn_lib.forward(q, k, v))
 
+                # PyTorch SDPA
+                t_torch, mem_torch = benchmark_stats(
+                    lambda: scaled_dot_product_attention(q, k, v))
+
+                speedup = t_torch / t_custom
                 print(
-                    f"{N:8d} | {d:8d} | {t_custom:12.4f} | {t_torch:12.4f} | {speedup:7.2f}x")
+                    f"{N:7d} | {d:3d} | {t_custom:10.3f} | {t_torch:10.3f} | {speedup:7.2f}x | {mem_torch:12.2f}")
+
             except Exception as e:
-                print(f"{N:8d} | {d:8d} | Error: {str(e)[:20]}...")
+                print(f"{N:7d} | {d:3d} | Error: {str(e)[:25]}")
 
 
 if __name__ == "__main__":
