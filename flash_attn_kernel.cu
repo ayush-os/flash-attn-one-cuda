@@ -64,7 +64,7 @@ __global__ void flash_attn_kernel(const half *__restrict__ q_ptr,
             else
             {
                 Kj[idx] = __float2half(-65504.0f);;
-                Vj[idx] = 0.0f;
+                Vj[idx] = __float2half(0.0f);
             }
         }
         __syncthreads();
