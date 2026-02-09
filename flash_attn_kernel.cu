@@ -17,7 +17,7 @@ __global__ void flash_attn_kernel(const float *__restrict__ q_ptr,
                                   const int Br,
                                   const float softmax_scale)
 {
-    const int d_padded = d + 1; 
+    const int d_padded = d + 1;
     extern __shared__ float s[];
     float *Qi = s;
     float *Kj = &Qi[Br * d_padded];
@@ -37,18 +37,18 @@ __global__ void flash_attn_kernel(const float *__restrict__ q_ptr,
 
     int row_idx = i + threadIdx.x;
 
-    if (row_idx < N)
+    for (int idx = threadIdx.x; idx < (Br * d); idx += blockDim.x)
     {
-        for (int j = 0; j < d; j++)
+        int row = idx / d;
+        int col = idx % d;
+        int col_row_idx = j + row;
+        if (col_row_idx < N)
         {
-            Qi[threadIdx.x * d_padded + j] = q_ptr[qkv_offset + (row_idx * d) + j];
+            Qi[row * d_padded + col] = q_ptr[qkv_offset + (j * d) + idx];
         }
-    }
-    else
-    {
-        for (int j = 0; j < d; j++)
+        else
         {
-            Qi[threadIdx.x * d_padded + j] = 0.0f;
+            Qi[row * d_padded + col] = 0.0f;
         }
     }
 
