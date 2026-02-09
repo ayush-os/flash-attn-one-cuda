@@ -1,17 +1,25 @@
 # flash-attn-one-cuda
 
 # Create the environment
+
 python3 -m venv venv
 
 # Activate it
+
 source venv/bin/activate
 
 # Install the essentials
+
 pip install torch numpy ninja
-***
-***
-***
-***
+
+---
+
+---
+
+---
+
+---
+
 ### STEP 1: BASELINE: 155.466 ms
 
 ### STEP 2: AFTER PARALLELIZING OUTER LOOP OVER BLOCKS: 22.979 ms (6.77x faster than baseline)
@@ -24,3 +32,4 @@ pip install torch numpy ninja
 
 tried moving Q into regs but way too much register pressure caused minor slowdown
 
+### STEP 6: CLEANUP (removing l and m arrays, etc): 5.304 (1.2x faster than step 5)
