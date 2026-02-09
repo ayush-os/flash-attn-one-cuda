@@ -41,7 +41,7 @@ __global__ void flash_attn_kernel(const float *__restrict__ q_ptr,
         int r = idx / (d / 4);
         int c_v = idx % (d / 4);
         int shared_idx = r * d_padded + c_v * 4;
-        int global_row = i + row;
+        int global_row = i + r;
         if (global_row < N)
         {
             reinterpret_cast<float4 *>(&Qi[shared_idx])[0] = q_ptr_4[global_row * (d / 4) + c_v];
