@@ -33,3 +33,6 @@ pip install torch numpy ninja
 tried moving Q into regs but way too much register pressure caused minor slowdown
 
 ### STEP 6: CLEANUP (removing l and m arrays, etc): 5.304 (1.2x faster than step 5)
+
+### STEP 7: FP32 to FP16 - 6.226 ms (seems like i lost)
+## virtually no gain but necessary step for tensor core compatability
