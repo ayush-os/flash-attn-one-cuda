@@ -6,9 +6,8 @@
 
 using namespace nvcuda;
 
+// --- Tuning Parameters ---
 #define WARP_SIZE 32
-
-// WMMA Shape Constants
 const int WMMA_M = 16;
 const int WMMA_N = 16;
 const int WMMA_K = 16;
@@ -24,19 +23,18 @@ __global__ void flash_attn_tc_kernel(
     const int N,
     const float softmax_scale)
 {
-    // --- Setup & Indexing ---
-    const int d = HEAD_DIM;
+    // The number of 16-wide fragments needed to cover dimension d
     const int num_frags_d = HEAD_DIM / 16;
+    const int d = HEAD_DIM;
 
-    // Grid: x=Q_blocks, y=Heads, z=Batch
+    // --- Indexing ---
     int batch_idx = blockIdx.z;
     int head_idx = blockIdx.y;
-    int q_block_idx = blockIdx.x; // Processes rows [q_block_idx*16 .. +16]
+    int q_block_idx = blockIdx.x; // Block index for Q rows
 
     int tid = threadIdx.x;
 
-    // Global Memory Offsets
-    // q, k, v shape: [B, nh, N, d]
+    // Base Offsets
     long long qkv_offset = (long long)batch_idx * nh * N * d + (long long)head_idx * N * d;
     const half *q_base = q + qkv_offset;
     const half *k_base = k + qkv_offset;
@@ -47,27 +45,21 @@ __global__ void flash_attn_tc_kernel(
     if (q_row_start >= N)
         return;
 
-    // --- Shared Memory Allocation ---
+    // --- Shared Memory ---
+    // s_smem: Stores scores (S) and later probabilities (P).
+    // o_smem: Stores output accumulators (O).
     extern __shared__ float smem[];
+    float *s_smem_f = smem;                          // Float view for Score Accumulation
+    half *s_smem_h = reinterpret_cast<half *>(smem); // Half view for P matrix (aliased)
+    float *o_smem = &smem[16 * 16];                  // Float view for O Accumulation
 
-    // Layout:
-    // 1. S_tile: 16x16 floats (used for Scores).
-    //    Later reused as 16x16 halves (for Probabilities P).
-    float *s_smem_f = smem;                          // Size: 256 floats (1024 bytes)
-    half *s_smem_h = reinterpret_cast<half *>(smem); // Size: 256 halves (512 bytes) - Aliased!
-
-    // 2. O_tile: 16 rows * d cols (floats).
-    //    Placed after S_tile.
-    float *o_smem = &smem[16 * 16];
-
-    // Initialize O accumulator in Shared Memory to 0.0f
+    // Initialize O accumulator in Shared Memory
     for (int i = tid; i < 16 * d; i += blockDim.x)
     {
         o_smem[i] = 0.0f;
     }
 
-    // 3. Row Statistics (Max m, Sum l)
-    //    Placed after O_tile.
+    // Row Statistics (Max m, Sum l)
     float *row_m = &o_smem[16 * d];
     float *row_l = &row_m[16];
 
@@ -78,7 +70,8 @@ __global__ void flash_attn_tc_kernel(
     }
     __syncthreads();
 
-    // --- Load Q (Reused for all K blocks) ---
+    // --- Register Fragments ---
+    // Q is constant for the whole loop, load once.
     wmma::fragment<wmma::matrix_a, WMMA_M, WMMA_N, WMMA_K, half, wmma::row_major> q_frag[HEAD_DIM / 16];
 
 #pragma unroll
@@ -88,75 +81,98 @@ __global__ void flash_attn_tc_kernel(
         wmma::load_matrix_sync(q_frag[i], ptr, d);
     }
 
-    // --- Main Loop: Iterate over K and V (dim N) ---
-    // We process K/V in blocks of 16 (WMMA_N)
+    // Double Buffering Registers for K and V
+    // "curr" holds data for iteration j
+    // "next" holds data for iteration j+16
+    wmma::fragment<wmma::matrix_b, WMMA_M, WMMA_N, WMMA_K, half, wmma::col_major> k_frag_curr[HEAD_DIM / 16];
+    wmma::fragment<wmma::matrix_b, WMMA_M, WMMA_N, WMMA_K, half, wmma::col_major> k_frag_next[HEAD_DIM / 16];
+
+    wmma::fragment<wmma::matrix_b, WMMA_M, WMMA_N, WMMA_K, half, wmma::row_major> v_frag_curr[HEAD_DIM / 16];
+    wmma::fragment<wmma::matrix_b, WMMA_M, WMMA_N, WMMA_K, half, wmma::row_major> v_frag_next[HEAD_DIM / 16];
+
+// --- Prologue: Load first tile (j=0) ---
+#pragma unroll
+    for (int i = 0; i < num_frags_d; i++)
+    {
+        // Load K0 (Transposed)
+        const half *k_ptr = k_base + 0 * d + i * 16;
+        wmma::load_matrix_sync(k_frag_curr[i], k_ptr, d);
+
+        // Load V0
+        const half *v_ptr = v_base + 0 * d + i * 16;
+        wmma::load_matrix_sync(v_frag_curr[i], v_ptr, d);
+    }
+
+    // --- Main Loop ---
     for (int j = 0; j < N; j += 16)
     {
 
-        // --------------------------------------------------------
-        // Step 1: Compute S = Q * K^T
-        // --------------------------------------------------------
+        // 1. Prefetch Next Tile (j + 16)
+        // Issue loads *before* doing the heavy math for the current tile.
+        // The latency of these loads will be hidden by the MMA instructions below.
+        int next_j = j + 16;
+        bool next_exists = (next_j < N);
+
+        if (next_exists)
+        {
+#pragma unroll
+            for (int i = 0; i < num_frags_d; i++)
+            {
+                const half *k_ptr = k_base + next_j * d + i * 16;
+                wmma::load_matrix_sync(k_frag_next[i], k_ptr, d);
+
+                const half *v_ptr = v_base + next_j * d + i * 16;
+                wmma::load_matrix_sync(v_frag_next[i], v_ptr, d);
+            }
+        }
+
+        // 2. Compute S = Q * K_curr^T
         wmma::fragment<wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, float> s_acc;
         wmma::fill_fragment(s_acc, 0.0f);
 
 #pragma unroll
         for (int k_idx = 0; k_idx < num_frags_d; k_idx++)
         {
-            // Load K tile (Transposed via Col_Major)
-            const half *ptr = k_base + j * d + k_idx * 16;
-            wmma::fragment<wmma::matrix_b, WMMA_M, WMMA_N, WMMA_K, half, wmma::col_major> k_frag;
-            wmma::load_matrix_sync(k_frag, ptr, d);
-
-            wmma::mma_sync(s_acc, q_frag[k_idx], k_frag, s_acc);
+            wmma::mma_sync(s_acc, q_frag[k_idx], k_frag_curr[k_idx], s_acc);
         }
 
-        // Store Accumulator (float) to Shared Memory (float)
+        // Store Scores to Shared Memory
         wmma::store_matrix_sync(s_smem_f, s_acc, 16, wmma::mem_row_major);
         __syncthreads();
 
-        // --------------------------------------------------------
-        // Step 2: Softmax & Rescaling
-        // --------------------------------------------------------
-        // Only first 16 threads (1 per row) perform this logic
+        // 3. Softmax & Online Output Update
         if (tid < 16)
         {
             int row = tid;
 
-            // A. Find Max
+            // Find Max
             float local_max = -1e20f;
             for (int c = 0; c < 16; c++)
             {
-                // Read float score
                 float val = s_smem_f[row * 16 + c] * softmax_scale;
                 if (val > local_max)
                     local_max = val;
-                // Temporarily store scaled value back (optional optimization)
-                s_smem_f[row * 16 + c] = val;
+                s_smem_f[row * 16 + c] = val; // Optimization: store scaled value
             }
 
-            // B. Update Statistics
+            // Update Stats
             float m_prev = row_m[row];
             float l_prev = row_l[row];
             float m_curr = max(m_prev, local_max);
 
-            // C. Compute P (Exp) and Sum
+            // Compute Exp & Sum
             float local_sum = 0.0f;
             for (int c = 0; c < 16; c++)
             {
-                float val = s_smem_f[row * 16 + c]; // already scaled
+                float val = s_smem_f[row * 16 + c];
                 float p = expf(val - m_curr);
-
-                // Write half directly to alias buffer
-                // Safe: write index (half*) <= read index (float*)
-                s_smem_h[row * 16 + c] = __float2half(p);
-
+                s_smem_h[row * 16 + c] = __float2half(p); // Store P
                 local_sum += p;
             }
 
-            // D. Rescale Previous Output (O) if Max changed
-            // O_new = O_old * exp(m_prev - m_curr)
+            // Rescale O if max changed
             if (m_prev != m_curr)
-            { // optimization
+            {
                 float o_scale = expf(m_prev - m_curr);
                 for (int c = 0; c < d; c++)
                 {
@@ -164,48 +180,50 @@ __global__ void flash_attn_tc_kernel(
                 }
             }
 
-            // E. Save new stats
-            // L_new = L_prev * exp(m_prev - m_curr) + local_sum
-            row_l[row] = l_prev * expf(m_prev - m_curr) + local_sum;
             row_m[row] = m_curr;
+            row_l[row] = l_prev * expf(m_prev - m_curr) + local_sum;
         }
         __syncthreads();
 
-        // --------------------------------------------------------
-        // Step 3: Compute O += P * V
-        // --------------------------------------------------------
-
-        // Load P (Matrix A) from Shared Memory (now half)
+        // 4. Compute O += P * V_curr
+        // Load P (Matrix A)
         wmma::fragment<wmma::matrix_a, WMMA_M, WMMA_N, WMMA_K, half, wmma::row_major> p_frag;
         wmma::load_matrix_sync(p_frag, s_smem_h, 16);
 
-        // Iterate over column blocks of V (size d)
+// Accumulate
+#pragma unroll
         for (int k_idx = 0; k_idx < num_frags_d; k_idx++)
         {
-            // Load V chunk
-            const half *v_ptr = v_base + j * d + k_idx * 16;
-            wmma::fragment<wmma::matrix_b, WMMA_M, WMMA_N, WMMA_K, half, wmma::row_major> v_frag;
-            wmma::load_matrix_sync(v_frag, v_ptr, d);
-
             // Load O accumulator from Shared Memory
             float *o_ptr = o_smem + k_idx * 16;
             wmma::fragment<wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, float> o_frag;
             wmma::load_matrix_sync(o_frag, o_ptr, d, wmma::mem_row_major);
 
-            // MMA: O = O + P * V
-            wmma::mma_sync(o_frag, p_frag, v_frag, o_frag);
+            // O += P * V
+            wmma::mma_sync(o_frag, p_frag, v_frag_curr[k_idx], o_frag);
 
-            // Store back to Shared Memory
+            // Store back
             wmma::store_matrix_sync(o_ptr, o_frag, d, wmma::mem_row_major);
         }
         __syncthreads();
+
+        // 5. Shift "Next" to "Current" for next iteration
+        if (next_exists)
+        {
+#pragma unroll
+            for (int i = 0; i < num_frags_d; i++)
+            {
+                k_frag_curr[i] = k_frag_next[i];
+                v_frag_curr[i] = v_frag_next[i];
+            }
+        }
     }
 
-    // --- Finalize: O = O / L ---
+    // --- Finalize & Write Output ---
     if (tid < 16)
     {
         int row = tid;
-        float inv_l = 1.0f / (row_l[row] + 1e-6f); // Add epsilon for stability
+        float inv_l = 1.0f / (row_l[row] + 1e-6f);
         for (int c = 0; c < d; c++)
         {
             o_smem[row * d + c] *= inv_l;
@@ -213,18 +231,13 @@ __global__ void flash_attn_tc_kernel(
     }
     __syncthreads();
 
-    // --- Write Output to Global Memory ---
     for (int i = tid; i < 16 * d; i += blockDim.x)
     {
-        // Coalesced write
         out_base[q_row_start * d + i] = __float2half(o_smem[i]);
     }
 }
 
-// --------------------------------------------------------
 // Host Launcher
-// --------------------------------------------------------
-
 void launch_flash_attn_tc(
     const torch::Tensor &q,
     const torch::Tensor &k,
@@ -242,12 +255,8 @@ void launch_flash_attn_tc(
     TORCH_CHECK(N % 16 == 0, "Seq len must be multiple of 16");
 
     dim3 grid(N / 16, nh, B);
-    dim3 block(32); // 1 Warp per block
+    dim3 block(32);
 
-    // Shared Memory Calculation
-    // s_smem (float): 16*16*4 = 1024 bytes
-    // o_smem (float): 16*d*4 bytes
-    // row_stats (float): 16*2*4 = 128 bytes
     size_t smem_size = 1024 + (16 * d * sizeof(float)) + 128;
 
     if (d == 32)
