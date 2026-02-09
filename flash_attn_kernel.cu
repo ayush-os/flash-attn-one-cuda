@@ -36,7 +36,7 @@ __global__ void flash_attn_tc_kernel(
     int tid = threadIdx.x;
 
     // global memory offsets
-    long long qkv_offset = (long long)(batch_idx * nh * N * d) + (long long)(head_idx * N * d);
+    long long qkv_offset = (long long)batch_idx * nh * N * d + (long long)head_idx * N * d;
     const half *q_base = q + qkv_offset;
     const half *k_base = k + qkv_offset;
     const half *v_base = v + qkv_offset;
@@ -51,11 +51,14 @@ __global__ void flash_attn_tc_kernel(
     float *s_smem_f = s;
     half *s_smem_h = reinterpret_cast<half *>(s);
     float *o_smem = &s[16 * 16];
-    float *row_m = &o_smem[16 * d];
-    float *row_l = &row_m[16 * 1];
 
-    for (int i = tid; i < (16 * d); i += blockDim.x)
+    for (int i = tid; i < 16 * d; i += blockDim.x)
+    {
         o_smem[i] = 0.0f;
+    }
+
+    float *row_m = &o_smem[16 * d];
+    float *row_l = &row_m[16];
 
     if (tid < 16)
     {
@@ -70,8 +73,8 @@ __global__ void flash_attn_tc_kernel(
 #pragma unroll
     for (int i = 0; i < num_frags_d; i++)
     {
-        const half *q_ptr = q_base + (q_row_start * d) + (i * 16);
-        wmma::load_matrix_sync(q_frag[i], q_ptr, d);
+        const half *ptr = q_base + q_row_start * d + i * 16;
+        wmma::load_matrix_sync(q_frag[i], ptr, d);
     }
 
     // iterate over KV
@@ -83,11 +86,10 @@ __global__ void flash_attn_tc_kernel(
 #pragma unroll
         for (int k_idx = 0; k_idx < num_frags_d; k_idx++)
         {
-            const half *k_ptr = k_base + (j * d) + (k_idx * 16);
+            const half *ptr = k_base + j * d + k_idx * 16;
             wmma::fragment<wmma::matrix_b, WMMA_M, WMMA_N, WMMA_K, half, wmma::col_major> k_frag;
-            wmma::load_matrix_sync(k_frag, k_ptr, d);
+            wmma::load_matrix_sync(k_frag, ptr, d);
 
-            // compute Q * K^T
             wmma::mma_sync(s_acc, q_frag[k_idx], k_frag, s_acc);
         }
 
@@ -149,11 +151,11 @@ __global__ void flash_attn_tc_kernel(
         wmma::load_matrix_sync(p_frag, s_smem_h, 16);
         for (int k_idx = 0; k_idx < num_frags_d; k_idx++)
         {
-            const half *v_ptr = v_base + (j * d) + (k_idx * 16);
-            wmma::fragment<wmma::matrix_b, WMMA_M, WMMA_N, WMMA_K, half, wmma::col_major> v_frag;
+            const half *v_ptr = v_base + j * d + k_idx * 16;
+            wmma::fragment<wmma::matrix_b, WMMA_M, WMMA_N, WMMA_K, half, wmma::row_major> v_frag;
             wmma::load_matrix_sync(v_frag, v_ptr, d);
 
-            float *o_ptr = o_smem + (k_idx * 16);
+            float *o_ptr = o_smem + k_idx * 16;
             wmma::fragment<wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, float> o_frag;
             wmma::load_matrix_sync(o_frag, o_ptr, d, wmma::mem_row_major);
 
@@ -169,16 +171,16 @@ __global__ void flash_attn_tc_kernel(
     {
         int row = tid;
         float inv_l = 1.0f / (row_l[row] + 1e-6f); // epsilon for stability
-        for (int j = 0; j < d; j++)
+        for (int c = 0; c < d; c++)
         {
-            o_smem[row * d + j] *= inv_l;
+            o_smem[row * d + c] *= inv_l;
         }
     }
     __syncthreads();
 
-    for (int i = tid; i < (16 * d); i += blockIdx.x)
+    for (int i = tid; i < 16 * d; i += blockDim.x)
     {
-        out_base[(q_row_start * d) + i] = __float2half(o_smem[i]);
+        out_base[q_row_start * d + i] = __float2half(o_smem[i]);
     }
 }
 
