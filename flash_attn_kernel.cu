@@ -2,9 +2,6 @@
 #include <cuda.h>
 #include <cuda_runtime.h>
 
-// Helper to easily access float4
-#define FETCH_FLOAT4(pointer) (reinterpret_cast<const float4 *>(&(pointer))[0])
-
 template <int head_dim>
 __global__ void flash_attn_kernel(const float *__restrict__ q_ptr,
                                   const float *__restrict__ k_ptr,
@@ -20,9 +17,7 @@ __global__ void flash_attn_kernel(const float *__restrict__ q_ptr,
                                   const int Br,
                                   const float softmax_scale)
 {
-    // PADDING: Changed to +4 to ensure alignment for float4 while reducing bank conflicts
-    const int d_padded = d + 4;
-
+    const int d_padded = d + 1;
     extern __shared__ float s[];
     float *Qi = s;
     float *Kj = &Qi[Br * d_padded];
@@ -33,72 +28,50 @@ __global__ void flash_attn_kernel(const float *__restrict__ q_ptr,
 
     int i = blockIdx.z * Br;
 
-    float Oi[head_dim]; // Registers for output
+    float Oi[head_dim];
     float li = 0.0f;
     float mi = -INFINITY;
 
-    // Initialize Output Registers
     for (int idx = 0; idx < d; idx++)
         Oi[idx] = 0.0f;
 
     int row_idx = i + threadIdx.x;
 
-    // --- 1. Load Q (Vectorized) ---
-    // We treat the Q block as a collection of float4s.
-    // Each thread copies "some" float4s.
-    // Note: We must handle the padding manually (Global is compact, Shared is strided).
-    const int num_float4s = (Br * d) / 4;
-    const float4 *q_ptr_4 = reinterpret_cast<const float4 *>(q_ptr + qkv_offset);
-
-    for (int idx = threadIdx.x; idx < num_float4s; idx += blockDim.x)
+    for (int idx = threadIdx.x; idx < (Br * d); idx += blockDim.x)
     {
-        int row = idx / (d / 4);
-        int col_vec = idx % (d / 4);
-        int global_row = i + row;
-
-        if (global_row < N)
+        int row = idx / d;
+        int col = idx % d;
+        int q_row_idx = i + row;
+        if (q_row_idx < N)
         {
-            float4 val = q_ptr_4[global_row * (d / 4) + col_vec];
-            // Write to shared memory with padding
-            reinterpret_cast<float4 *>(&Qi[row * d_padded + col_vec * 4])[0] = val;
+            Qi[row * d_padded + col] = q_ptr[qkv_offset + (q_row_idx * d) + col];
         }
         else
         {
-            reinterpret_cast<float4 *>(&Qi[row * d_padded + col_vec * 4])[0] = {0.f, 0.f, 0.f, 0.f};
+            Qi[row * d_padded + col] = 0.0f;
         }
     }
 
-    // --- 2. Main Loop ---
     for (int j = 0; j < N; j += Bc)
     {
-        // Load K and V (Vectorized)
-        // Similar logic to Q loading
-        const int num_float4s_kv = (Bc * d) / 4;
-        const float4 *k_ptr_4 = reinterpret_cast<const float4 *>(k_ptr + qkv_offset);
-        const float4 *v_ptr_4 = reinterpret_cast<const float4 *>(v_ptr + qkv_offset);
-
-        for (int idx = threadIdx.x; idx < num_float4s_kv; idx += blockDim.x)
+        for (int idx = threadIdx.x; idx < (Bc * d); idx += blockDim.x)
         {
-            int row = idx / (d / 4); // This is actually 'col' in K^T context, but row in K matrix
-            int col_vec = idx % (d / 4);
-            int global_row = j + row; // The row index in K/V matrices
-
-            if (global_row < N)
+            int row = idx / d;
+            int col = idx % d;
+            int col_row_idx = j + row;
+            if (col_row_idx < N)
             {
-                float4 k_val = k_ptr_4[global_row * (d / 4) + col_vec];
-                float4 v_val = v_ptr_4[global_row * (d / 4) + col_vec];
-                reinterpret_cast<float4 *>(&Kj[row * d_padded + col_vec * 4])[0] = k_val;
-                reinterpret_cast<float4 *>(&Vj[row * d_padded + col_vec * 4])[0] = v_val;
+                Kj[row * d_padded + col] = k_ptr[qkv_offset + (j * d) + idx];
+                Vj[row * d_padded + col] = v_ptr[qkv_offset + (j * d) + idx];
             }
             else
             {
-                reinterpret_cast<float4 *>(&Kj[row * d_padded + col_vec * 4])[0] = {0.f, 0.f, 0.f, 0.f};
-                reinterpret_cast<float4 *>(&Vj[row * d_padded + col_vec * 4])[0] = {0.f, 0.f, 0.f, 0.f};
+                Kj[row * d_padded + col] = 0.0f;
+                Vj[row * d_padded + col] = 0.0f;
             }
         }
         __syncthreads();
 
-        // Compute Attention
         if (row_idx < N)
         {
             for (int ii = 0; ii < Bc; ii++)
@@ -107,80 +80,53 @@ __global__ void flash_attn_kernel(const float *__restrict__ q_ptr,
                     break;
 
                 float Sij = 0.f;
-                // Vectorized Dot Product (Q * K^T)
-                for (int jj = 0; jj < d; jj += 4)
+                for (int jj = 0; jj < d; jj++)
                 {
-                    float4 q_vec = FETCH_FLOAT4(Qi[threadIdx.x * d_padded + jj]);
-                    float4 k_vec = FETCH_FLOAT4(Kj[ii * d_padded + jj]);
-
-                    Sij += q_vec.x * k_vec.x;
-                    Sij += q_vec.y * k_vec.y;
-                    Sij += q_vec.z * k_vec.z;
-                    Sij += q_vec.w * k_vec.w;
+                    Sij += Qi[(threadIdx.x * d_padded) + jj] * Kj[(ii * d_padded) + jj];
                 }
                 Sij *= softmax_scale;
 
-                // Online Softmax
                 float old_mi = mi;
                 mi = max(old_mi, Sij);
+
                 float alpha = expf(old_mi - mi);
                 float beta = expf(Sij - mi);
+
                 li = li * alpha + beta;
 
-                // Vectorized Value Accumulation (O * V)
-                for (int k = 0; k < d; k += 4)
+                for (int k = 0; k < d; k++)
                 {
-                    float4 v_vec = FETCH_FLOAT4(Vj[ii * d_padded + k]);
-                    // Oi = Oi * alpha + beta * V
-                    // We can't cast Oi array to float4 easily if it's in registers,
-                    // but we can unroll manually.
-                    Oi[k] = Oi[k] * alpha + beta * v_vec.x;
-                    Oi[k + 1] = Oi[k + 1] * alpha + beta * v_vec.y;
-                    Oi[k + 2] = Oi[k + 2] * alpha + beta * v_vec.z;
-                    Oi[k + 3] = Oi[k + 3] * alpha + beta * v_vec.w;
+                    Oi[k] = Oi[k] * alpha + beta * Vj[ii * d_padded + k];
                 }
             }
         }
         __syncthreads();
     }
 
-    // --- 3. Write Output (Vectorized + Coalesced) ---
-
-    // Write l and m
     if (row_idx < N)
     {
         l[lm_offset + row_idx] = li;
         m[lm_offset + row_idx] = mi;
     }
 
-    // Stage Output to Shared Memory (to coalesce global write)
     if (row_idx < N)
     {
-        for (int k = 0; k < d; k += 4)
+        for (int k = 0; k < d; k++)
         {
-            float4 val;
-            val.x = Oi[k] / li;
-            val.y = Oi[k + 1] / li;
-            val.z = Oi[k + 2] / li;
-            val.w = Oi[k + 3] / li;
-            reinterpret_cast<float4 *>(&Qi[threadIdx.x * d_padded + k])[0] = val;
+            Qi[threadIdx.x * d_padded + k] = Oi[k] / li;
         }
     }
+
     __syncthreads();
 
-    // Coalesced Write to Global Memory using float4
-    float4 *out_ptr_4 = reinterpret_cast<float4 *>(out + qkv_offset);
-    for (int idx = threadIdx.x; idx < num_float4s; idx += blockDim.x)
+    for (int idx = threadIdx.x; idx < (Br * d); idx += blockDim.x)
     {
-        int row = idx / (d / 4);
-        int col_vec = idx % (d / 4);
-        int global_row = i + row;
+        int r = idx / d;
+        int c = idx % d;
+        int global_row = i + r;
 
         if (global_row < N)
-        {
-            float4 val = reinterpret_cast<float4 *>(&Qi[row * d_padded + col_vec * 4])[0];
-            out_ptr_4[global_row * (d / 4) + col_vec] = val;
-        }
+            out[qkv_offset + (global_row * d) + c] = Qi[r * d_padded + c];
     }
 }
 
@@ -240,7 +186,7 @@ torch::Tensor flash_attn_cuda_forward(torch::Tensor q, torch::Tensor k, torch::T
     size_t max_sram = props.sharedMemPerBlock;
 
     int Br = 64;
-    int d_padded = d + 4;
+    int d_padded = d + 1;
 
     int remaining_sram = max_sram - (Br * d_padded * sizeof(float));
     int Bc = remaining_sram / (2 * d_padded * sizeof(float));
