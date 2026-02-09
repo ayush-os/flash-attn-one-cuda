@@ -24,138 +24,161 @@ __global__ void flash_attn_tc_kernel(
     const int N,
     const float softmax_scale)
 {
-    const int d_padded = d + 4;
+    // init constants
+    const int d = HEAD_DIM;
+    const int num_frags_d = HEAD_DIM / 16;
 
-    extern __shared__ half s[];
-    half *Qi = s;
-    half *Kj = &Qi[Br * d_padded];
-    half *Vj = &Kj[Bc * d_padded];
+    // get the grid
+    int batch_idx = blockIdx.z;
+    int head_idx = blockIdx.y;
+    int q_block_idx = blockIdx.x;
 
-    int qkv_offset = (blockIdx.x * nh * N * d) + (blockIdx.y * N * d);
-    int i = blockIdx.z * Br;
-    int row_idx = i + threadIdx.x;
+    int tid = threadIdx.x;
 
-    float Oi[head_dim];
-    float li = 0.0f;
-    float mi = -1e20f;
+    // global memory offsets
+    long long qkv_offset = (long long)(batch_idx * nh * N * d) + (long long)(head_idx * N * d);
+    const half *q_base = q + qkv_offset;
+    const half *k_base = k + qkv_offset;
+    const half *v_base = v + qkv_offset;
+    half *out_base = out + qkv_offset;
 
-    for (int idx = 0; idx < d; idx++)
-        Oi[idx] = 0.0f;
+    int q_row_start = q_block_idx * 16;
+    if (q_row_start >= N)
+        return;
 
-    const int num_vectors = (Br * d) / 4;
-    const half *q_ptr_base = q_ptr + qkv_offset;
+    // shared memory initialization
+    extern __shared__ float s[];
+    float *s_smem_f = s;
+    half *s_smem_h = reinterpret_cast<half *>(s);
+    float *o_smem = &s[16 * 16];
+    float *row_m = &o_smem[16 * d];
+    float *row_l = &row_m[16 * 1];
 
-    for (int idx = threadIdx.x; idx < num_vectors; idx += blockDim.x)
+    for (int i = tid; i < (16 * d); i += blockDim.x)
+        o_smem[i] = 0.0f;
+
+    if (tid < 16)
     {
-        int r = idx / (d / 4);
-        int c_v = idx % (d / 4);
-        int shared_idx = r * d_padded + c_v * 4;
-        int global_row = i + r;
+        row_m[tid] = -1e20f;
+        row_l[tid] = 0.0f;
+    }
+    __syncthreads();
 
-        if (global_row < N)
+    // Load in Q
+    wmma::fragment<wmma::matrix_a, WMMA_M, WMMA_N, WMMA_K, half, wmma::row_major> q_frag[HEAD_DIM / 16];
+
+#pragma unroll
+    for (int i = 0; i < num_frags_d; i++)
+    {
+        half *q_ptr = q_base + (q_row_start * d) + (i * 16);
+        wmma::load_matrix_sync(q_frag[i], q_ptr, d);
+    }
+
+    // iterate over KV
+    for (int j = 0; j < N; j += 16)
+    {
+        wmma::fragment<wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, float> s_acc;
+        wmma::fill_fragment(s_acc, 0.0f);
+
+#pragma unroll
+        for (int k_idx = 0; k_idx < num_frags_d; k_idx++)
         {
-            float2 vec = reinterpret_cast<const float2 *>(q_ptr_base + global_row * d)[c_v];
-            reinterpret_cast<float2 *>(&Qi[shared_idx])[0] = vec;
+            const half *k_ptr = k_base + (j * d) + (k_idx * 16);
+            wmma::fragment<wmma::matrix_b, WMMA_M, WMMA_N, WMMA_K, half, wmma::col_major> k_frag;
+            wmma::load_matrix_sync(k_frag, k_ptr, d);
+
+            // compute Q * K^T
+            wmma::mma_sync(s_acc, q_frag[k_idx], k_frag, s_acc);
         }
-        else
+
+        // store to S
+        wmma::store_matrix_sync(s_smem_f, s_acc, 16, wmma::mem_row_major);
+        __syncthreads();
+
+        // softmax
+        if (tid < 16)
         {
-            reinterpret_cast<float2 *>(&Qi[shared_idx])[0] = {0.f, 0.f};
+            int row = tid;
+
+            // find max
+            float local_max = -1e20f;
+
+            for (int c = 0; c < 16; c++)
+            {
+                float val = s_smem_f[row * 16 + c] * softmax_scale;
+                if (val > local_max)
+                    local_max = val;
+                s_smem_f[row * 16 + c] = val;
+            }
+
+            // update stats
+            float m_prev = row_m[row];
+            float l_prev = row_l[row];
+            float m_curr = max(m_prev, local_max);
+
+            // compute p (exp) and sum
+            float local_sum = 0.0f;
+            for (int c = 0; c < 16; c++)
+            {
+                float val = s_smem_f[row * 16 + c];
+                float p = expf(val - m_curr);
+
+                s_smem_h[row * 16 + c] = __float2half(p);
+
+                local_sum += p;
+            }
+
+            // correct previous output o
+            if (m_prev != m_curr)
+            {
+                float o_scale = expf(m_prev - m_curr);
+                for (int c = 0; c < d; c++)
+                {
+                    o_smem[row * d + c] *= o_scale;
+                }
+            }
+
+            // save new stats
+            row_l[row] = l_prev * expf(m_prev - m_curr) + local_sum;
+            row_m[row] = m_curr;
+        }
+        __syncthreads();
+
+        // multiply P by V
+        wmma::fragment<wmma::matrix_a, WMMA_M, WMMA_N, WMMA_K, half, wmma::row_major> p_frag;
+        wmma::load_matrix_sync(p_frag, s_smem_h, 16);
+        for (int k_idx = 0; k_idx < num_frags_d; k_idx++)
+        {
+            const half *v_ptr = v_base + (j * d) + (k_idx * 16);
+            wmma::fragment<wmma::matrix_b, WMMA_M, WMMA_N, WMMA_K, half, wmma::col_major> v_frag;
+            wmma::load_matrix_sync(v_frag, v_ptr, d);
+
+            float *o_ptr = o_smem + (k_idx * 16);
+            wmma::fragment<wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, float> o_frag;
+            wmma::load_matrix_sync(o_frag, o_ptr, d, wmma::mem_row_major);
+
+            // compute P * V
+            wmma::mma_sync(o_frag, p_frag, v_frag, o_frag);
+
+            wmma::store_matrix_sync(o_ptr, o_frag, d, wmma::mem_row_major);
+        }
+        __syncthreads();
+    }
+
+    if (tid < 16)
+    {
+        int row = tid;
+        float inv_l = 1.0f / (row_l[row] + 1e-6f); // epsilon for stability
+        for (int j = 0; j < d; j++)
+        {
+            o_smem[row * d + j] *= inv_l;
         }
     }
     __syncthreads();
 
-    for (int j = 0; j < N; j += Bc)
+    for (int i = tid; i < (16 * d); i += blockIdx.x)
     {
-        const int num_vectors_kv = (Bc * d) / 4;
-        const half *k_ptr_base = k_ptr + qkv_offset;
-        const half *v_ptr_base = v_ptr + qkv_offset;
-
-        for (int idx = threadIdx.x; idx < num_vectors_kv; idx += blockDim.x)
-        {
-            int r = idx / (d / 4);
-            int c_v = idx % (d / 4);
-            int global_row = j + r;
-            int shared_idx = r * d_padded + c_v * 4;
-
-            if (global_row < N)
-            {
-                float2 k_vec = reinterpret_cast<const float2 *>(k_ptr_base + global_row * d)[c_v];
-                float2 v_vec = reinterpret_cast<const float2 *>(v_ptr_base + global_row * d)[c_v];
-
-                reinterpret_cast<float2 *>(&Kj[shared_idx])[0] = k_vec;
-                reinterpret_cast<float2 *>(&Vj[shared_idx])[0] = v_vec;
-            }
-            else
-            {
-                reinterpret_cast<float2 *>(&Kj[shared_idx])[0] = {0.f, 0.f};
-                reinterpret_cast<float2 *>(&Vj[shared_idx])[0] = {0.f, 0.f};
-            }
-        }
-        __syncthreads();
-
-        if (row_idx < N)
-        {
-            for (int ii = 0; ii < Bc; ii++)
-            {
-                if ((j + ii) >= N)
-                    break;
-
-                float Sij = 0.f;
-                for (int jj = 0; jj < d; jj += 4)
-                {
-                    float2 q_vec_f2 = FETCH_HALF4(Qi[(threadIdx.x * d_padded) + jj]);
-                    float2 k_vec_f2 = FETCH_HALF4(Kj[(ii * d_padded) + jj]);
-
-                    const half *q_h = reinterpret_cast<const half *>(&q_vec_f2);
-                    const half *k_h = reinterpret_cast<const half *>(&k_vec_f2);
-
-                    Sij += __half2float(q_h[0]) * __half2float(k_h[0]);
-                    Sij += __half2float(q_h[1]) * __half2float(k_h[1]);
-                    Sij += __half2float(q_h[2]) * __half2float(k_h[2]);
-                    Sij += __half2float(q_h[3]) * __half2float(k_h[3]);
-                }
-                Sij *= softmax_scale;
-
-                float mi_prev = mi;
-                mi = max(mi_prev, Sij);
-
-                float exp_prev = expf(mi_prev - mi);
-                float exp_curr = expf(Sij - mi);
-
-                li = li * exp_prev + exp_curr;
-
-                for (int k = 0; k < d; k += 4)
-                {
-                    float2 v_vec_f2 = FETCH_HALF4(Vj[ii * d_padded + k]);
-                    const half *v_h = reinterpret_cast<const half *>(&v_vec_f2);
-
-                    Oi[k] = Oi[k] * exp_prev + exp_curr * __half2float(v_h[0]);
-                    Oi[k + 1] = Oi[k + 1] * exp_prev + exp_curr * __half2float(v_h[1]);
-                    Oi[k + 2] = Oi[k + 2] * exp_prev + exp_curr * __half2float(v_h[2]);
-                    Oi[k + 3] = Oi[k + 3] * exp_prev + exp_curr * __half2float(v_h[3]);
-                }
-            }
-        }
-        __syncthreads();
-    }
-
-    if (row_idx < N)
-    {
-        half *out_ptr_row = out + qkv_offset + row_idx * d;
-        float inv_li = 1.0f / li;
-
-        for (int k = 0; k < d; k += 4)
-        {
-            float2 final_val_f2;
-            half *final_val_h = reinterpret_cast<half *>(&final_val_f2);
-
-            final_val_h[0] = __float2half(Oi[k] * inv_li);
-            final_val_h[1] = __float2half(Oi[k + 1] * inv_li);
-            final_val_h[2] = __float2half(Oi[k + 2] * inv_li);
-            final_val_h[3] = __float2half(Oi[k + 3] * inv_li);
-
-            reinterpret_cast<float2 *>(&out_ptr_row[k])[0] = final_val_f2;
-        }
+        out_base[(q_row_start * d) + i] = __float_to_half(o_smem[i]);
     }
 }
 
