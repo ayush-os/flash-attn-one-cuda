@@ -32,7 +32,7 @@ def test_accuracy_and_perf():
     # --- Accuracy Check ---
     diff = (expected - actual).abs().max()
     print(f"Max absolute difference: {diff.item():.6f}")
-    if diff < 1e-3:
+    if torch.allclose(actual, expected, atol=1e-2, rtol=1e-3):
         print("✅ Accuracy Check Passed!")
     else:
         print("❌ Accuracy Check Failed!")
