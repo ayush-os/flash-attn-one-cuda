@@ -44,11 +44,11 @@ __global__ void flash_attn_kernel(const float *__restrict__ q_ptr,
         int global_row = i + row;
         if (global_row < N)
         {
-            reinterpret_cast<float4 *>(&Qi[shared_index])[0] = q_ptr_4[global_row * (d / 4) + c_v];
+            reinterpret_cast<float4 *>(&Qi[shared_idx])[0] = q_ptr_4[global_row * (d / 4) + c_v];
         }
         else
         {
-            reinterpret_cast<float4 *>(&Qi[shared_index])[0] = {0.f, 0.f, 0.f, 0.f};
+            reinterpret_cast<float4 *>(&Qi[shared_idx])[0] = {0.f, 0.f, 0.f, 0.f};
         }
     }
     __syncthreads();
@@ -63,7 +63,7 @@ __global__ void flash_attn_kernel(const float *__restrict__ q_ptr,
         {
             int r = idx / (d / 4);
             int c_v = idx % (d / 4);
-            int global_row = j + row;
+            int global_row = j + r;
             int shared_idx = r * d_padded + c_v * 4;
 
             if (global_row < N)
