@@ -41,10 +41,10 @@ __global__ void flash_attn_kernel(const float *__restrict__ q_ptr,
     {
         int row = idx / d;
         int col = idx % d;
-        int col_row_idx = j + row;
-        if (col_row_idx < N)
+        int q_row_idx = i + row;
+        if (q_row_idx < N)
         {
-            Qi[row * d_padded + col] = q_ptr[qkv_offset + (j * d) + idx];
+            Qi[row * d_padded + col] = q_ptr[qkv_offset + (q_row_idx * d) + col];
         }
         else
         {
