@@ -2,21 +2,27 @@
 #include <cuda.h>
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
+#include <mma.h>
 
-#define FETCH_HALF4(pointer) (reinterpret_cast<const float2 *>(&(pointer))[0])
+using namespace nvcuda;
 
-template <int head_dim>
-__global__ void flash_attn_kernel(const half *__restrict__ q_ptr,
-                                  const half *__restrict__ k_ptr,
-                                  const half *__restrict__ v_ptr,
-                                  half *out,
-                                  const int B,
-                                  const int nh,
-                                  const int N,
-                                  const int d,
-                                  const int Bc,
-                                  const int Br,
-                                  const float softmax_scale)
+#define WARP_SIZE 32
+
+// WMMA Shape Constants
+const int WMMA_M = 16;
+const int WMMA_N = 16;
+const int WMMA_K = 16;
+
+template <int HEAD_DIM>
+__global__ void flash_attn_tc_kernel(
+    const half *__restrict__ q,
+    const half *__restrict__ k,
+    const half *__restrict__ v,
+    half *__restrict__ out,
+    const int B,
+    const int nh,
+    const int N,
+    const float softmax_scale)
 {
     const int d_padded = d + 4;
 
@@ -153,37 +159,48 @@ __global__ void flash_attn_kernel(const half *__restrict__ q_ptr,
     }
 }
 
-void launch_flash_attn_kernel(const torch::Tensor &q,
-                              const torch::Tensor &k,
-                              const torch::Tensor &v,
-                              torch::Tensor &out,
-                              int B,
-                              int nh,
-                              int N,
-                              int d,
-                              int Bc,
-                              int Br,
-                              float scale,
-                              dim3 grid,
-                              dim3 block,
-                              size_t smem)
+void launch_flash_attn_tc(
+    const torch::Tensor &q,
+    const torch::Tensor &k,
+    const torch::Tensor &v,
+    torch::Tensor &out)
 {
-    const half *q_ptr = reinterpret_cast<const half *>(q.data_ptr<at::Half>());
-    const half *k_ptr = reinterpret_cast<const half *>(k.data_ptr<at::Half>());
-    const half *v_ptr = reinterpret_cast<const half *>(v.data_ptr<at::Half>());
-    half *out_ptr = reinterpret_cast<half *>(out.data_ptr<at::Half>());
+    const int B = q.size(0);
+    const int nh = q.size(1);
+    const int N = q.size(2);
+    const int d = q.size(3);
 
-    if (d <= 32)
+    float softmax_scale = 1.0f / sqrtf(d);
+
+    TORCH_CHECK(d % 16 == 0, "Head dim must be multiple of 16");
+    TORCH_CHECK(N % 16 == 0, "Seq len must be multiple of 16");
+
+    dim3 grid(N / 16, nh, B);
+    dim3 block(32); // 1 Warp per block
+
+    // Shared Memory Calculation
+    // s_smem (float): 16*16*4 = 1024 bytes
+    // o_smem (float): 16*d*4 bytes
+    // row_stats (float): 16*2*4 = 128 bytes
+    size_t smem_size = 1024 + (16 * d * sizeof(float)) + 128;
+
+    if (d == 32)
     {
-        flash_attn_kernel<32><<<grid, block, smem>>>(q_ptr, k_ptr, v_ptr, out_ptr, B, nh, N, d, Bc, Br, scale);
+        flash_attn_tc_kernel<32><<<grid, block, smem_size>>>(
+            (half *)q.data_ptr(), (half *)k.data_ptr(), (half *)v.data_ptr(), (half *)out.data_ptr(),
+            B, nh, N, softmax_scale);
     }
-    else if (d <= 64)
+    else if (d == 64)
     {
-        flash_attn_kernel<64><<<grid, block, smem>>>(q_ptr, k_ptr, v_ptr, out_ptr, B, nh, N, d, Bc, Br, scale);
+        flash_attn_tc_kernel<64><<<grid, block, smem_size>>>(
+            (half *)q.data_ptr(), (half *)k.data_ptr(), (half *)v.data_ptr(), (half *)out.data_ptr(),
+            B, nh, N, softmax_scale);
     }
-    else if (d <= 128)
+    else if (d == 128)
     {
-        flash_attn_kernel<128><<<grid, block, smem>>>(q_ptr, k_ptr, v_ptr, out_ptr, B, nh, N, d, Bc, Br, scale);
+        flash_attn_tc_kernel<128><<<grid, block, smem_size>>>(
+            (half *)q.data_ptr(), (half *)k.data_ptr(), (half *)v.data_ptr(), (half *)out.data_ptr(),
+            B, nh, N, softmax_scale);
     }
     else
     {
@@ -197,49 +214,7 @@ torch::Tensor flash_attn_cuda_forward(torch::Tensor q, torch::Tensor k, torch::T
     TORCH_CHECK(k.scalar_type() == at::kHalf, "K must be FP16");
     TORCH_CHECK(v.scalar_type() == at::kHalf, "V must be FP16");
 
-    const int B = q.size(0);
-    const int nh = q.size(1);
-    const int N = q.size(2);
-    const int d = q.size(3);
-
-    float softmax_scale = 1.0 / sqrt(d);
-
-    int device_id;
-    cudaGetDevice(&device_id);
-    cudaDeviceProp props;
-    cudaGetDeviceProperties(&props, device_id);
-
-    size_t max_sram = props.sharedMemPerBlock;
-
-    int Br = 64;
-    int d_padded = d + 4;
-
-    int remaining_sram = max_sram - (Br * d_padded * sizeof(half));
-    int Bc = remaining_sram / (2 * d_padded * sizeof(half));
-
-    Bc = std::min(Bc, N);
-
-    torch::Tensor out = torch::zeros_like(q);
-
-    dim3 grid(B, nh, (N + Br - 1) / Br);
-    dim3 block(Br);
-
-    size_t smem_bytes = (Br * d_padded + 2 * Bc * d_padded) * sizeof(half);
-
-    launch_flash_attn_kernel(q,
-                             k,
-                             v,
-                             out,
-                             B,
-                             nh,
-                             N,
-                             d,
-                             Bc,
-                             Br,
-                             softmax_scale,
-                             grid,
-                             block,
-                             smem_bytes);
-
+    auto out = torch::empty_like(q);
+    launch_flash_attn_tc(q, k, v, out);
     return out;
 }
