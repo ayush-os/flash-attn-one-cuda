@@ -158,17 +158,12 @@ torch::Tensor flash_attn_cuda_forward(torch::Tensor q, torch::Tensor k, torch::T
 
     float softmax_scale = 1.0 / sqrt(d);
 
-    auto options = torch::TensorOptions().dtype(q.dtype()).device(q.device());
-
-    // Step 1: Set block sizes
-    const int SRAM_SIZE = 48000;
-    int Bc = std::max(1, SRAM_SIZE / (4 * d * (int)sizeof(half)));
-    int Br = 64;
+    auto logsum_options = torch::TensorOptions().dtype(torch::kFloat32).device(q.device());
 
     // Step 2: Init O, l, m
     torch::Tensor out = torch::zeros_like(q);
-    torch::Tensor l = torch::zeros({B, nh, N}, options);
-    torch::Tensor m = torch::full({B, nh, N}, -INFINITY, options);
+    torch::Tensor l = torch::zeros({B, nh, N}, logsum_options);
+    torch::Tensor m = torch::full({B, nh, N}, -INFINITY, logsum_options);
 
     dim3 grid(B, nh, (N + Br - 1) / Br);
     dim3 block(Br);
