@@ -178,10 +178,10 @@ torch::Tensor flash_attn_cuda_forward(torch::Tensor q, torch::Tensor k, torch::T
     size_t smem_bytes = (Br * d + 2 * Bc * d) * sizeof(half);
 
     launch_flash_attn_kernel(
-        q.data_ptr<at::half>(),
-        k.data_ptr<at::half>(),
-        v.data_ptr<at::half>(),
-        out.data_ptr<at::half>(),
+        q.data_ptr<at::Half>(),
+        k.data_ptr<at::Half>(),
+        v.data_ptr<at::Half>(),
+        out.data_ptr<at::Half>(),
         l.data_ptr<float>(),
         m.data_ptr<float>(),
         B,
