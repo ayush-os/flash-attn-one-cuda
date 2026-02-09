@@ -74,6 +74,10 @@ __global__ void flash_attn_kernel(const float *__restrict__ q_ptr,
             {
                 for (int ii = 0; ii < Bc; ii++)
                 {
+                    if ((j + ii) >= N)
+                    {
+                        break;
+                    }
                     float Sij = 0.f;
                     for (int jj = 0; jj < d; jj++)
                     {
