@@ -13,9 +13,9 @@ def test_accuracy_and_perf():
     B, nh, N, d = 4, 8, 1024, 64
     device = torch.device("cuda")
     
-    q = torch.randn(B, nh, N, d, device=device, dtype=torch.float16)
-    k = torch.randn(B, nh, N, d, device=device, dtype=torch.float16)
-    v = torch.randn(B, nh, N, d, device=device, dtype=torch.float16)
+    q = torch.randn(B, nh, N, d, device=device, dtype=torch.float32)
+    k = torch.randn(B, nh, N, d, device=device, dtype=torch.float32)
+    v = torch.randn(B, nh, N, d, device=device, dtype=torch.float32)
 
     # --- 1. Ground Truth (PyTorch) ---
     def manual_attn(q, k, v):
@@ -32,7 +32,7 @@ def test_accuracy_and_perf():
     # --- Accuracy Check ---
     diff = (expected - actual).abs().max()
     print(f"Max absolute difference: {diff.item():.6f}")
-    if torch.allclose(actual, expected, atol=1e-2, rtol=1e-3):
+    if diff < 1e-3:
         print("✅ Accuracy Check Passed!")
     else:
         print("❌ Accuracy Check Failed!")

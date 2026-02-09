@@ -1,14 +1,12 @@
-#include <torch/extension.h>
-#include <cuda_fp16.h>
 #include <torch/types.h>
 #include <cuda.h>
 #include <cuda_runtime.h>
 
 template <int head_dim>
-__global__ void flash_attn_kernel(const half *__restrict__ q_ptr,
-                                  const half *__restrict__ k_ptr,
-                                  const half *__restrict__ v_ptr,
-                                  half *out,
+__global__ void flash_attn_kernel(const float *__restrict__ q_ptr,
+                                  const float *__restrict__ k_ptr,
+                                  const float *__restrict__ v_ptr,
+                                  float *out,
                                   float *l,
                                   float *m,
                                   const int B,
@@ -19,10 +17,10 @@ __global__ void flash_attn_kernel(const half *__restrict__ q_ptr,
                                   const int Br,
                                   const float softmax_scale)
 {
-    extern __shared__ half s[];
-    half *Qi = s;
-    half *Kj = &Qi[Br * d];
-    half *Vj = &Kj[Bc * d];
+    extern __shared__ float s[];
+    float *Qi = s;
+    float *Kj = &Qi[Br * d];
+    float *Vj = &Kj[Bc * d];
 
     int qkv_offset = (blockIdx.x * nh * N * d) + (blockIdx.y * N * d);
     int lm_offset = (blockIdx.x * nh * N) + (blockIdx.y * N);
@@ -49,7 +47,7 @@ __global__ void flash_attn_kernel(const half *__restrict__ q_ptr,
     {
         for (int j = 0; j < d; j++)
         {
-            Qi[threadIdx.x * d + j] = __float2half(0.0f);
+            Qi[threadIdx.x * d + j] = 0.0f;
         }
     }
 
@@ -65,9 +63,8 @@ __global__ void flash_attn_kernel(const half *__restrict__ q_ptr,
             }
             else
             {
-                Kj[idx] = __float2half(-65504.0f);
-                ;
-                Vj[idx] = __float2half(0.0f);
+                Kj[idx] = 0.0f;
+                Vj[idx] = 0.0f;
             }
         }
         __syncthreads();
@@ -76,10 +73,14 @@ __global__ void flash_attn_kernel(const half *__restrict__ q_ptr,
         {
             for (int ii = 0; ii < Bc; ii++)
             {
+                if ((j + ii) >= N)
+                {
+                    break;
+                }
                 float Sij = 0.f;
                 for (int jj = 0; jj < d; jj++)
                 {
-                    Sij += __half2float(Qi[(threadIdx.x * d) + jj]) * __half2float(Kj[(ii * d) + jj]);
+                    Sij += Qi[(threadIdx.x * d) + jj] * Kj[(ii * d) + jj];
                 }
                 Sij *= softmax_scale;
 
@@ -93,7 +94,7 @@ __global__ void flash_attn_kernel(const half *__restrict__ q_ptr,
 
                 for (int k = 0; k < d; k++)
                 {
-                    Oi[k] = Oi[k] * alpha + beta * __half2float(Vj[ii * d + k]);
+                    Oi[k] = Oi[k] * alpha + beta * Vj[ii * d + k];
                 }
             }
         }
@@ -102,20 +103,20 @@ __global__ void flash_attn_kernel(const half *__restrict__ q_ptr,
 
     if (row_idx < N)
     {
-        half *out_row_ptr = out + qkv_offset + (row_idx * d);
+        float *out_row_ptr = out + qkv_offset + (row_idx * d);
         for (int k = 0; k < d; k++)
         {
-            out_row_ptr[k] = __float2half(Oi[k] / li);
+            out_row_ptr[k] = Oi[k] / li;
         }
         l[lm_offset + row_idx] = li;
         m[lm_offset + row_idx] = mi;
     }
 }
 
-void launch_flash_attn_kernel(const half *q,
-                              const half *k,
-                              const half *v,
-                              half *out,
+void launch_flash_attn_kernel(const float *q,
+                              const float *k,
+                              const float *v,
+                              float *out,
                               float *l,
                               float *m,
                               int B,
@@ -158,17 +159,17 @@ torch::Tensor flash_attn_cuda_forward(torch::Tensor q, torch::Tensor k, torch::T
 
     float softmax_scale = 1.0 / sqrt(d);
 
-    auto logsum_options = torch::TensorOptions().dtype(torch::kFloat32).device(q.device());
+    auto options = torch::TensorOptions().dtype(q.dtype()).device(q.device());
 
     // Step 1: Set block sizes
     const int SRAM_SIZE = 48000;
-    int Bc = std::max(1, SRAM_SIZE / (4 * d * (int)sizeof(half)));
-    int Br = 64;
-    
+    int Bc = std::max(1, SRAM_SIZE / (4 * d * (int)sizeof(float)));
+    int Br = 32;
+
     // Step 2: Init O, l, m
     torch::Tensor out = torch::zeros_like(q);
-    torch::Tensor l = torch::zeros({B, nh, N}, logsum_options);
-    torch::Tensor m = torch::full({B, nh, N}, -INFINITY, logsum_options);
+    torch::Tensor l = torch::zeros({B, nh, N}, options);
+    torch::Tensor m = torch::full({B, nh, N}, -INFINITY, options);
 
     dim3 grid(B, nh, (N + Br - 1) / Br);
     dim3 block(Br);
@@ -176,13 +177,13 @@ torch::Tensor flash_attn_cuda_forward(torch::Tensor q, torch::Tensor k, torch::T
     // Size in bytes for dynamic shared memory
     // Q_tile (Br * d) + K_tile (Bc * d) + V_tile (Bc * d)
     // O, l, m will be stored in regs
-    size_t smem_bytes = (Br * d + 2 * Bc * d) * sizeof(half);
+    size_t smem_bytes = (Br * d + 2 * Bc * d) * sizeof(float);
 
     launch_flash_attn_kernel(
-        reinterpret_cast<const half *>(q.data_ptr<at::Half>()),
-        reinterpret_cast<const half *>(k.data_ptr<at::Half>()),
-        reinterpret_cast<const half *>(v.data_ptr<at::Half>()),
-        reinterpret_cast<half *>(out.data_ptr<at::Half>()),
+        q.data_ptr<float>(),
+        k.data_ptr<float>(),
+        v.data_ptr<float>(),
+        out.data_ptr<float>(),
         l.data_ptr<float>(),
         m.data_ptr<float>(),
         B,
