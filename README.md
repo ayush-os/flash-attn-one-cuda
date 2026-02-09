@@ -38,3 +38,8 @@ tried moving Q into regs but way too much register pressure caused minor slowdow
 ## virtually no gain but necessary step for tensor core compatability
 
 ### STEP 8: TENSOR CORES 0.894 (5.9x faster than step 6)
+next optimizations to look into if i wasn't sick of this kernel at this point: 
+- larger tile sizes with multiple warps
+- k/v through shared mmory
+- keep O accumulators in registers
+- autotuning
