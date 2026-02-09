@@ -3,9 +3,9 @@
 #include <cuda_runtime.h>
 
 template <int head_dim>
-__global__ void flash_attn_kernel(const float *__restrict__ q,
-                                  const float *__restrict__ k,
-                                  const float *__restrict__ v,
+__global__ void flash_attn_kernel(const float *__restrict__ q_ptr,
+                                  const float *__restrict__ k_ptr,
+                                  const float *__restrict__ v_ptr,
                                   float *out,
                                   float *l,
                                   float *m,
@@ -22,104 +22,92 @@ __global__ void flash_attn_kernel(const float *__restrict__ q,
     float *Kj = &Qi[Br * d];
     float *Vj = &Kj[Bc * d];
 
-    float Oi[head_dim];
-    float li;
-    float mi;
-
     int qkv_offset = (blockIdx.x * nh * N * d) + (blockIdx.y * N * d);
     int lm_offset = (blockIdx.x * nh * N) + (blockIdx.y * N);
 
-    // inverting loops from paper's algorithm for less HBM writes
-    for (int i = 0; i < N; i += Br) // step 7
+    for (int i = 0; i < N; i += Br)
     {
-        // step 8: load Qi, Oi, li, mi into sram
+        float Oi[head_dim];
+        float li = 0.0f;
+        float mi = -INFINITY;
+
+        for (int i = 0; i < d; i++)
+            Oi[i] = 0.0f;
+
         int row_idx = i + threadIdx.x;
-        float *out_row_ptr;
 
         if (row_idx < N)
         {
-            const float *q_row_ptr = q + qkv_offset + (row_idx * d);
-            out_row_ptr = out + qkv_offset + (row_idx * d);
-            for (int k = 0; k < d; k++)
+            const float *q_row_ptr = q_ptr + qkv_offset + (row_idx * d);
+            for (int j = 0; j < d; j++)
             {
-                Qi[threadIdx.x * d + k] = q_row_ptr[k];
-                Oi[k] = out_row_ptr[k];
+                Qi[threadIdx.x * d + j] = q_row_ptr[j];
             }
-            li = l[lm_offset + row_idx];
-            mi = m[lm_offset + row_idx];
         }
         else
         {
-            for (int k = 0; k < d; k++)
+            for (int j = 0; j < d; j++)
             {
-                Qi[threadIdx.x * d + k] = 0.0f;
-                Oi[k] = 0.0f;
+                Qi[threadIdx.x * d + j] = 0.0f;
             }
-            li = 0.0f;
-            mi = -INFINITY;
         }
-        __syncthreads(); // technically removable, but better for clarity - at this point, Qi is fully loaded
 
-        for (int j = 0; j < N; j += Bc) // step 5
+        for (int j = 0; j < N; j += Bc)
         {
-            // step 6: load Kj, Vj into sram
-            for (int k = threadIdx.x; k < (Bc * d); k += blockDim.x)
+            for (int idx = threadIdx.x; idx < (Bc * d); idx += blockDim.x)
             {
-                int col_row_idx = j + (k / d);
+                int col_row_idx = j + (idx / d);
                 if (col_row_idx < N)
                 {
-                    Kj[k] = k[qkv_offset + (j * d) + k];
-                    Vj[k] = v[qkv_offset + (j * d) + k];
+                    Kj[idx] = k_ptr[qkv_offset + (j * d) + idx];
+                    Vj[idx] = v_ptr[qkv_offset + (j * d) + idx];
                 }
                 else
                 {
-                    Kj[k] = 0.0f;
-                    Vj[k] = 0.0f;
+                    Kj[idx] = 0.0f;
+                    Vj[idx] = 0.0f;
                 }
             }
-            __syncthreads(); // at this point Kj and Vj are fully loaded
+            __syncthreads();
 
-            float mij = -INFINITY;
-            float lij = 0.0f;
-            // step 9: compute Sij = QiKj^T
-            for (int ii = 0; ii < Bc; ii++) {
-                float sum = 0.f;
-                for (int jj = 0; jj < d; jj++) {
-                    sum += Qi[(threadIdx.x * d) + jj] * Kj[(ii * d) + jj];
-                }
-                float Sij = sum * softmax_scale;
+            if (row_idx < N)
+            {
+                for (int ii = 0; ii < Bc; ii++)
+                {
+                    float Sij = 0.f;
+                    for (int jj = 0; jj < d; jj++)
+                    {
+                        Sij += Qi[(threadIdx.x * d) + jj] * Kj[(ii * d) + jj];
+                    }
+                    Sij *= softmax_scale;
 
-                // step 10: compute mij, lij, Pij
-                float old_mij = mij;                
-                mij = max(mij, Sij);
+                    float old_mi = mi;
+                    mi = max(old_mi, Sij);
 
-                float factor = expf(old_mij - mij);
-                float Pij = expf(Sij - mij)
-                lij = (lij * factor) + Pij;
+                    float alpha = expf(old_mi - mi);
+                    float beta = expf(Sij - mi);
 
-                // step 12: Pij to Oi
-                for (int k = 0; k < d; k++) {
-                    Oi[k] = (Oi[k] * factor) + (Pij * Vj[ii * d + k]);
+                    li = li * alpha + beta;
+
+                    for (int k = 0; k < d; k++)
+                    {
+                        Oi[k] = Oi[k] * alpha + beta * Vj[ii * d + k];
+                    }
                 }
             }
-            __syncthreads(); // make sure thread does not start overwriting Kj and Vj currently in use
+            __syncthreads();
         }
 
-        if (row_idx < N) {
-            // step 11
-            float mi_new = max(mi, mij);
-            float factor_mi = expf(mi - mi_new);
-            float factor_mij = expf(mij - mi_new);
-            float li_new = factor_mi * li + factor_mij * lij;
-
-            l[lm_offset + row_idx] = li_new;
-            m[lm_offset + row_idx] = mi_new;
-
-            for (int k = 0; k < d; k++) {
-                out_row_ptr[k] = Oi[k] / li_new;
+        if (row_idx < N)
+        {
+            float *out_row_ptr = out + qkv_offset + (row_idx * d);
+            for (int k = 0; k < d; k++)
+            {
+                out_row_ptr[k] = Oi[k] / li;
             }
+            l[lm_offset + row_idx] = li;
+            m[lm_offset + row_idx] = mi;
         }
-
         __syncthreads();
     }
 }
